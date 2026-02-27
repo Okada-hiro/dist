@@ -349,6 +349,11 @@ def main() -> None:
     p.add_argument("--save-strategy", choices=["no", "epoch"], default="no")
     p.add_argument("--fixed-spk-id", type=int, default=0)
     p.add_argument(
+        "--adamw-foreach",
+        action="store_true",
+        help="Enable foreach AdamW kernels. Disabled by default for allocator stability.",
+    )
+    p.add_argument(
         "--speaker-embedding-pt",
         default=None,
         help="Path to fixed speaker embedding tensor (*.pt). Shape must be [hidden] or [1, hidden].",
@@ -395,7 +400,13 @@ def main() -> None:
 
     collator = QwenLikeCollator(config=model.config, max_codec_len=args.max_codec_len, fixed_spk_id=args.fixed_spk_id)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collator)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=0.01,
+        foreach=args.adamw_foreach,
+    )
+    print(f"[INFO] optimizer=AdamW foreach={'on' if args.adamw_foreach else 'off'}")
     fixed_speaker_embedding = _resolve_fixed_speaker_embedding(
         model,
         speaker_embedding_pt=args.speaker_embedding_pt,
