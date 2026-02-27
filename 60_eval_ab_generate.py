@@ -1,5 +1,7 @@
 import argparse
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -84,31 +86,55 @@ def _sanitize_nested_model_type(cfg: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
-def _load_qwen3_model(model_path_or_id: str, device: str, dtype: torch.dtype, attn_impl: str):
+def _load_qwen3_model(model_path_or_id: str, device: str, torch_dtype: torch.dtype, attn_impl: str):
     try:
         return Qwen3TTSModel.from_pretrained(
             model_path_or_id,
             device_map=device,
-            dtype=dtype,
+            torch_dtype=torch_dtype,
             attn_implementation=attn_impl,
         )
     except TypeError as e:
         # Common with locally saved checkpoints where nested configs include model_type.
         if "unexpected keyword argument 'model_type'" not in str(e):
             raise
-        cfg_path = Path(model_path_or_id) / "config.json"
+        model_dir = Path(model_path_or_id)
+        if not model_dir.exists():
+            raise
+        cfg_path = model_dir / "config.json"
         if not cfg_path.exists():
             raise
         raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         clean_cfg = _sanitize_nested_model_type(raw_cfg)
-        cfg_obj = Qwen3TTSConfig(**clean_cfg)
-        return Qwen3TTSModel.from_pretrained(
-            model_path_or_id,
-            config=cfg_obj,
-            device_map=device,
-            dtype=dtype,
-            attn_implementation=attn_impl,
-        )
+        # AutoProcessor may read config.json again; create a sanitized temp model dir.
+        with tempfile.TemporaryDirectory(prefix="qwen3tts_sanitized_") as td:
+            td_path = Path(td)
+            for item in model_dir.iterdir():
+                dst = td_path / item.name
+                if item.name == "config.json":
+                    continue
+                try:
+                    os.symlink(item, dst, target_is_directory=item.is_dir())
+                except OSError:
+                    # Fallback when symlink is unavailable.
+                    if item.is_dir():
+                        import shutil
+                        shutil.copytree(item, dst)
+                    else:
+                        import shutil
+                        shutil.copy2(item, dst)
+            (td_path / "config.json").write_text(
+                json.dumps(clean_cfg, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            cfg_obj = Qwen3TTSConfig(**clean_cfg)
+            return Qwen3TTSModel.from_pretrained(
+                str(td_path),
+                config=cfg_obj,
+                device_map=device,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_impl,
+            )
 
 
 def main() -> None:
@@ -130,13 +156,13 @@ def main() -> None:
     rows = _load_jsonl(Path(args.input_jsonl))
 
     device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
+    torch_dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
 
     print(f"[INFO] loading teacher: {args.teacher_model}")
     attn_impl = "flash_attention_2" if str(device).startswith("cuda") else "sdpa"
-    teacher = _load_qwen3_model(args.teacher_model, device=device, dtype=dtype, attn_impl=attn_impl)
+    teacher = _load_qwen3_model(args.teacher_model, device=device, torch_dtype=torch_dtype, attn_impl=attn_impl)
     print(f"[INFO] loading student: {args.student_model}")
-    student = _load_qwen3_model(args.student_model, device=device, dtype=dtype, attn_impl=attn_impl)
+    student = _load_qwen3_model(args.student_model, device=device, torch_dtype=torch_dtype, attn_impl=attn_impl)
 
     meta_rows: list[dict[str, Any]] = []
     for i, r in enumerate(rows):
