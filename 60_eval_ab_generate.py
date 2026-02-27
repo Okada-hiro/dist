@@ -56,6 +56,10 @@ def _gen_one(
     ref_audio: str,
     ref_text: str,
     max_new_tokens: int,
+    do_sample: bool,
+    top_k: int,
+    top_p: float,
+    temperature: float,
 ) -> tuple[list[Any], int]:
     wavs, sr = model.generate_voice_clone(
         text=text,
@@ -64,10 +68,10 @@ def _gen_one(
         ref_text=ref_text,
         x_vector_only_mode=False,
         non_streaming_mode=True,
-        do_sample=True,
-        top_k=50,
-        top_p=0.95,
-        temperature=0.8,
+        do_sample=do_sample,
+        top_k=top_k,
+        top_p=top_p,
+        temperature=temperature,
         max_new_tokens=max_new_tokens,
     )
     return wavs, sr
@@ -171,6 +175,10 @@ def main() -> None:
     p.add_argument("--out-dir", default="dist/eval_ab")
     p.add_argument("--default-language", default="Japanese")
     p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument("--do-sample", action="store_true", help="Enable stochastic decoding (default: deterministic).")
+    p.add_argument("--top-k", type=int, default=50)
+    p.add_argument("--top-p", type=float, default=0.95)
+    p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--device", default=None, help="cuda:0 / cpu. default: auto")
     args = p.parse_args()
 
@@ -203,13 +211,31 @@ def main() -> None:
 
         t0 = time.perf_counter()
         twavs, tsr = _gen_one(
-            teacher, text, language, args.ref_audio, ref_text, args.max_new_tokens
+            teacher,
+            text,
+            language,
+            args.ref_audio,
+            ref_text,
+            args.max_new_tokens,
+            args.do_sample,
+            args.top_k,
+            args.top_p,
+            args.temperature,
         )
         teacher_ms = (time.perf_counter() - t0) * 1000.0
 
         t1 = time.perf_counter()
         swavs, ssr = _gen_one(
-            student, text, language, args.ref_audio, ref_text, args.max_new_tokens
+            student,
+            text,
+            language,
+            args.ref_audio,
+            ref_text,
+            args.max_new_tokens,
+            args.do_sample,
+            args.top_k,
+            args.top_p,
+            args.temperature,
         )
         student_ms = (time.perf_counter() - t1) * 1000.0
 
