@@ -13,6 +13,43 @@ from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 
 
+def _to_int_list(x: Any) -> list[int]:
+    """
+    Normalize various json/tensor-like forms to flat list[int].
+    Handles:
+      - list[int]
+      - list[list[int]] (flatten)
+      - torch.Tensor
+      - scalar int/float
+    """
+    if x is None:
+        return []
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().tolist()
+    if isinstance(x, (int, float)):
+        return [int(x)]
+    if isinstance(x, list):
+        out: list[int] = []
+        for v in x:
+            if isinstance(v, list):
+                out.extend(_to_int_list(v))
+            elif isinstance(v, torch.Tensor):
+                out.extend(_to_int_list(v))
+            elif isinstance(v, (int, float)):
+                out.append(int(v))
+            else:
+                # unknown nested type -> try best effort cast
+                try:
+                    out.append(int(v))
+                except Exception:
+                    continue
+        return out
+    try:
+        return [int(x)]
+    except Exception:
+        return []
+
+
 class DistillJsonlDataset(Dataset):
     def __init__(self, path: str):
         self.rows = []
@@ -35,7 +72,19 @@ class DistillJsonlDataset(Dataset):
                     if "codes" in row and isinstance(row["codes"], list):
                         row["codec_ids"] = row["codes"]
 
+                # Prefer explicit flattened codec sequence if present.
+                if "codec_ids_flat" in row:
+                    row["codec_ids"] = row["codec_ids_flat"]
+                elif "codec_ids_2d" in row and "codec_ids" not in row:
+                    row["codec_ids"] = row["codec_ids_2d"]
+
                 if "text_input_ids" not in row or "codec_ids" not in row:
+                    self.skipped += 1
+                    continue
+
+                row["text_input_ids"] = _to_int_list(row["text_input_ids"])
+                row["codec_ids"] = _to_int_list(row["codec_ids"])
+                if len(row["text_input_ids"]) == 0 or len(row["codec_ids"]) == 0:
                     self.skipped += 1
                     continue
 
@@ -64,8 +113,8 @@ class DistillCollator:
         teacher_topk = []
 
         for row in features:
-            text_ids = row.get("text_input_ids", row.get("input_ids", row.get("text_ids")))
-            codec_ids = row.get("codec_ids", row.get("codes"))
+            text_ids = _to_int_list(row.get("text_input_ids", row.get("input_ids", row.get("text_ids"))))
+            codec_ids = _to_int_list(row.get("codec_ids", row.get("codes")))
             if text_ids is None or codec_ids is None:
                 continue
             if len(text_ids) == 0 or len(codec_ids) == 0:

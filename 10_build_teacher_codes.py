@@ -148,7 +148,15 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
         )
 
-        codec_ids = talker_codes_list[0].detach().cpu().to(torch.long).tolist()
+        codec_tensor = talker_codes_list[0].detach().cpu().to(torch.long)
+        if codec_tensor.ndim == 1:
+            codec_ids_2d = codec_tensor.unsqueeze(-1).tolist()
+            codec_ids_flat = codec_tensor.tolist()
+            num_code_groups = 1
+        else:
+            codec_ids_2d = codec_tensor.tolist()
+            codec_ids_flat = codec_tensor.reshape(-1).tolist()
+            num_code_groups = int(codec_tensor.shape[1])
         text_input_ids = input_ids[0].detach().cpu().to(torch.long).tolist()
 
         out_rows.append(
@@ -157,19 +165,25 @@ def main() -> None:
                 "text": text,
                 "language": language,
                 "text_input_ids": text_input_ids,
-                "codec_ids": codec_ids,
+                # Keep both representations:
+                # - codec_ids_2d: decode-compatible shape (T, num_code_groups)
+                # - codec_ids_flat: LM training-friendly 1D sequence
+                "codec_ids_2d": codec_ids_2d,
+                "codec_ids_flat": codec_ids_flat,
+                # Backward-compatible field name (flat)
+                "codec_ids": codec_ids_flat,
+                "num_code_groups": num_code_groups,
             }
         )
 
         if artifacts_dir is not None:
-            codec_tensor = talker_codes_list[0].detach().cpu().to(torch.long)
             wavs, sr = teacher.model.speech_tokenizer.decode([{"audio_codes": codec_tensor}])
             wav = wavs[0]
 
             wav_path = artifacts_dir / f"{sid}.teacher.wav"
             codec_path = artifacts_dir / f"{sid}.codec_ids.json"
             sf.write(str(wav_path), wav, sr)
-            codec_path.write_text(json.dumps(codec_ids, ensure_ascii=False), encoding="utf-8")
+            codec_path.write_text(json.dumps(codec_ids_2d, ensure_ascii=False), encoding="utf-8")
 
             artifact_meta_rows.append(
                 {
@@ -178,7 +192,8 @@ def main() -> None:
                     "language": language,
                     "wav_path": str(wav_path),
                     "codec_path": str(codec_path),
-                    "codec_len": int(len(codec_ids)),
+                    "codec_len": int(len(codec_ids_flat)),
+                    "num_code_groups": int(num_code_groups),
                     "sample_rate": int(sr),
                 }
             )
