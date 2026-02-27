@@ -7,6 +7,7 @@ from typing import Any
 import soundfile as sf
 import torch
 
+from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
 
@@ -69,6 +70,47 @@ def _gen_one(
     return wavs, sr
 
 
+def _sanitize_nested_model_type(cfg: dict[str, Any]) -> dict[str, Any]:
+    clean = json.loads(json.dumps(cfg))
+    for top_key in ("talker_config", "speaker_encoder_config"):
+        sub = clean.get(top_key)
+        if isinstance(sub, dict):
+            sub.pop("model_type", None)
+    tcfg = clean.get("talker_config")
+    if isinstance(tcfg, dict):
+        cp = tcfg.get("code_predictor_config")
+        if isinstance(cp, dict):
+            cp.pop("model_type", None)
+    return clean
+
+
+def _load_qwen3_model(model_path_or_id: str, device: str, dtype: torch.dtype, attn_impl: str):
+    try:
+        return Qwen3TTSModel.from_pretrained(
+            model_path_or_id,
+            device_map=device,
+            dtype=dtype,
+            attn_implementation=attn_impl,
+        )
+    except TypeError as e:
+        # Common with locally saved checkpoints where nested configs include model_type.
+        if "unexpected keyword argument 'model_type'" not in str(e):
+            raise
+        cfg_path = Path(model_path_or_id) / "config.json"
+        if not cfg_path.exists():
+            raise
+        raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        clean_cfg = _sanitize_nested_model_type(raw_cfg)
+        cfg_obj = Qwen3TTSConfig(**clean_cfg)
+        return Qwen3TTSModel.from_pretrained(
+            model_path_or_id,
+            config=cfg_obj,
+            device_map=device,
+            dtype=dtype,
+            attn_implementation=attn_impl,
+        )
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Generate teacher/student A-B wav pairs for eval.")
     p.add_argument("--teacher-model", required=True, help="Teacher model repo/local dir")
@@ -91,19 +133,10 @@ def main() -> None:
     dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
 
     print(f"[INFO] loading teacher: {args.teacher_model}")
-    teacher = Qwen3TTSModel.from_pretrained(
-        args.teacher_model,
-        device_map=device,
-        dtype=dtype,
-        attn_implementation="flash_attention_2" if str(device).startswith("cuda") else "sdpa",
-    )
+    attn_impl = "flash_attention_2" if str(device).startswith("cuda") else "sdpa"
+    teacher = _load_qwen3_model(args.teacher_model, device=device, dtype=dtype, attn_impl=attn_impl)
     print(f"[INFO] loading student: {args.student_model}")
-    student = Qwen3TTSModel.from_pretrained(
-        args.student_model,
-        device_map=device,
-        dtype=dtype,
-        attn_implementation="flash_attention_2" if str(device).startswith("cuda") else "sdpa",
-    )
+    student = _load_qwen3_model(args.student_model, device=device, dtype=dtype, attn_impl=attn_impl)
 
     meta_rows: list[dict[str, Any]] = []
     for i, r in enumerate(rows):
