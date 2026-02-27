@@ -32,6 +32,8 @@ def main() -> None:
     p.add_argument("--layer-ratio", type=float, default=0.5)
     p.add_argument("--hidden-ratio", type=float, default=0.8)
     p.add_argument("--ffn-ratio", type=float, default=0.8)
+    p.add_argument("--target-layers", type=int, default=None, help="Absolute layer count override for student config.")
+    p.add_argument("--layers-only", action="store_true", help="Only change layer count in student config.")
 
     # Teacher code generation options
     p.add_argument("--ref-audio", default="dist/ref_audio_24k.wav")
@@ -79,22 +81,25 @@ def main() -> None:
     teacher_codes = root / "train_teacher_codes.jsonl"
     student_ckpt = root / "student_ckpt"
 
-    run(
-        [
-            py,
-            "dist/00_make_student_config.py",
-            "--teacher-config",
-            teacher_config,
-            "--output",
-            str(student_config),
-            "--layer-ratio",
-            str(args.layer_ratio),
-            "--hidden-ratio",
-            str(args.hidden_ratio),
-            "--ffn-ratio",
-            str(args.ffn_ratio),
-        ]
-    )
+    cfg_cmd = [
+        py,
+        "dist/00_make_student_config.py",
+        "--teacher-config",
+        teacher_config,
+        "--output",
+        str(student_config),
+        "--layer-ratio",
+        str(args.layer_ratio),
+        "--hidden-ratio",
+        str(args.hidden_ratio),
+        "--ffn-ratio",
+        str(args.ffn_ratio),
+    ]
+    if args.target_layers is not None:
+        cfg_cmd += ["--target-layers", str(args.target_layers)]
+    if args.layers_only:
+        cfg_cmd.append("--layers-only")
+    run(cfg_cmd)
 
     cmd_build = [
         py,
