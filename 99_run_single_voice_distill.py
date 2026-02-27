@@ -24,8 +24,8 @@ def main() -> None:
     p.add_argument("--input-jsonl", required=True, help="Training text jsonl")
     p.add_argument(
         "--work-dir",
-        default="知識蒸留",
-        help="Working dir for outputs (default: 知識蒸留)",
+        default="dist",
+        help="Working dir for outputs (default: dist)",
     )
 
     # Student shape ratios
@@ -34,8 +34,8 @@ def main() -> None:
     p.add_argument("--ffn-ratio", type=float, default=0.8)
 
     # Teacher code generation options
-    p.add_argument("--ref-audio", default="知識蒸留/ref_audio.WAV")
-    p.add_argument("--ref-text-file", default="知識蒸留/ref_text.txt")
+    p.add_argument("--ref-audio", default="dist/ref_audio.WAV")
+    p.add_argument("--ref-text-file", default="dist/ref_text.txt")
     p.add_argument("--x-vector-only", action="store_true")
     p.add_argument("--non-streaming-mode", action="store_true")
     p.add_argument("--max-new-tokens", type=int, default=1024)
@@ -82,7 +82,7 @@ def main() -> None:
     run(
         [
             py,
-            "知識蒸留/00_make_student_config.py",
+            "dist/00_make_student_config.py",
             "--teacher-config",
             teacher_config,
             "--output",
@@ -98,7 +98,7 @@ def main() -> None:
 
     cmd_build = [
         py,
-        "知識蒸留/10_build_teacher_codes.py",
+        "dist/10_build_teacher_codes.py",
         "--teacher-model",
         args.teacher_model,
         "--input-jsonl",
@@ -123,7 +123,7 @@ def main() -> None:
     run(
         [
             py,
-            "知識蒸留/20_train_student_ce_kl.py",
+            "dist/20_train_student_ce_kl.py",
             "--teacher-model",
             args.teacher_model,
             "--student-config",
