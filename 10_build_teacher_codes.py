@@ -81,6 +81,11 @@ def main() -> None:
     p.add_argument("--x-vector-only", action="store_true")
     p.add_argument("--non-streaming-mode", action="store_true")
     p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument(
+        "--do-sample",
+        action="store_true",
+        help="Enable stochastic sampling. Default is deterministic generation.",
+    )
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=50)
@@ -141,7 +146,7 @@ def main() -> None:
             voice_clone_prompt=voice_clone_prompt_dict,
             languages=[language],
             non_streaming_mode=args.non_streaming_mode,
-            do_sample=True,
+            do_sample=args.do_sample,
             top_k=args.top_k,
             top_p=args.top_p,
             temperature=args.temperature,
