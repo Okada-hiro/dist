@@ -104,38 +104,30 @@ class DistillJsonlDataset(Dataset):
 
 @dataclass
 class DistillCollator:
-    bridge_token_id: int
     pad_token_id: int
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         seqs = []
-        labels = []
         teacher_topk = []
 
         for row in features:
-            text_ids = _to_int_list(row.get("text_input_ids", row.get("input_ids", row.get("text_ids"))))
             codec_ids = _to_int_list(row.get("codec_ids", row.get("codes")))
-            if text_ids is None or codec_ids is None:
+            if codec_ids is None:
                 continue
-            if len(text_ids) == 0 or len(codec_ids) == 0:
+            if len(codec_ids) < 2:
                 continue
 
-            input_ids = text_ids + [self.bridge_token_id] + codec_ids
-            lab = ([-100] * (len(text_ids) + 1)) + codec_ids
-
-            seqs.append(torch.tensor(input_ids, dtype=torch.long))
-            labels.append(torch.tensor(lab, dtype=torch.long))
+            seqs.append(torch.tensor(codec_ids, dtype=torch.long))
             teacher_topk.append(row.get("teacher_topk"))
 
         if not seqs:
-            raise ValueError("Batch has no valid samples. Check keys: text_input_ids/codec_ids in train jsonl.")
+            raise ValueError("Batch has no valid samples. Check keys: codec_ids in train jsonl.")
 
         input_ids = torch.nn.utils.rnn.pad_sequence(
             seqs, batch_first=True, padding_value=self.pad_token_id
         )
-        labels = torch.nn.utils.rnn.pad_sequence(
-            labels, batch_first=True, padding_value=-100
-        )
+        labels = input_ids.clone()
+        labels[input_ids == self.pad_token_id] = -100
         attention_mask = (input_ids != self.pad_token_id).long()
 
         return {
@@ -154,14 +146,25 @@ class DistillTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         teacher_topk = inputs.pop("teacher_topk", None)
-        outputs = model(**inputs)
+        # Qwen3TTSForConditionalGeneration itself does not expose training forward(input_ids).
+        # Train the talker directly with embeddings in prefill mode.
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        labels = inputs["labels"]
+
+        embeds = model.talker.get_input_embeddings()(input_ids)
+        outputs = model.talker(
+            inputs_embeds=embeds[:, :-1, :],
+            attention_mask=attention_mask[:, :-1],
+            labels=labels[:, 1:],
+        )
         ce_loss = outputs.loss
 
         # Optional sparse KL if dataset has teacher_topk.
         kl_loss = torch.tensor(0.0, device=ce_loss.device)
         if self.kl_alpha > 0 and teacher_topk is not None and any(x is not None for x in teacher_topk):
             logits = outputs.logits
-            labels = inputs["labels"]
+            labels = labels[:, 1:]
 
             # Shift for causal prediction: logits[t] predicts label[t].
             log_probs = F.log_softmax(logits / self.temperature, dim=-1)
@@ -209,7 +212,6 @@ def main() -> None:
     p.add_argument("--train-jsonl", required=True)
     p.add_argument("--eval-jsonl", default=None)
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--bridge-token-id", type=int, default=None)
     p.add_argument("--pad-token-id", type=int, default=None)
     p.add_argument("--kl-alpha", type=float, default=0.0)
     p.add_argument("--temperature", type=float, default=1.0)
@@ -218,6 +220,7 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--grad-accum", type=int, default=8)
     p.add_argument("--max-steps", type=int, default=-1)
+    p.add_argument("--dry-run-only", action="store_true", help="Run one forward/backward sanity check and exit.")
     args = p.parse_args()
 
     # Student config is a local json produced by 00_make_student_config.py.
@@ -225,10 +228,7 @@ def main() -> None:
     student_cfg = Qwen3TTSConfig(**cfg_dict)
     model = Qwen3TTSForConditionalGeneration(student_cfg)
 
-    # We use pre-tokenized ids from teacher data.
-    # Keep defaults compatible with observed Qwen3-TTS tokenizer ids.
     pad_token_id = args.pad_token_id if args.pad_token_id is not None else 2150
-    bridge_token_id = args.bridge_token_id if args.bridge_token_id is not None else 2150
 
     train_ds = DistillJsonlDataset(args.train_jsonl)
     eval_ds = DistillJsonlDataset(args.eval_jsonl) if args.eval_jsonl else None
@@ -243,7 +243,25 @@ def main() -> None:
             f"[INFO] eval rows: {len(eval_ds)}"
             + (f" (skipped={eval_ds.skipped})" if getattr(eval_ds, "skipped", 0) else "")
         )
-    collator = DistillCollator(bridge_token_id=bridge_token_id, pad_token_id=pad_token_id)
+    collator = DistillCollator(pad_token_id=pad_token_id)
+
+    # Sanity: model init + single forward/backward before full train.
+    sample_batch = collator([train_ds[0]])
+    sample_batch = {k: (v.to(model.device) if isinstance(v, torch.Tensor) else v) for k, v in sample_batch.items()}
+    model.train()
+    embeds = model.talker.get_input_embeddings()(sample_batch["input_ids"])
+    sanity_out = model.talker(
+        inputs_embeds=embeds[:, :-1, :],
+        attention_mask=sample_batch["attention_mask"][:, :-1],
+        labels=sample_batch["labels"][:, 1:],
+    )
+    sanity_loss = sanity_out.loss
+    sanity_loss.backward()
+    model.zero_grad(set_to_none=True)
+    print(f"[OK] dry-run passed: talker forward/backward loss={float(sanity_loss.detach().cpu()):.4f}")
+    if args.dry_run_only:
+        print("[DONE] dry-run-only mode, exiting without Trainer loop.")
+        return
 
     targs = TrainingArguments(
         output_dir=args.output_dir,
