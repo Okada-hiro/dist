@@ -1,6 +1,6 @@
 import argparse
+import copy
 import json
-import math
 from pathlib import Path
 
 
@@ -8,25 +8,54 @@ def _round_to_multiple(v: int, m: int) -> int:
     return max(m, int(round(v / m) * m))
 
 
+def _pick_key(d: dict, candidates: list[str]) -> str | None:
+    for k in candidates:
+        if k in d:
+            return k
+    return None
+
+
+def _find_model_cfg_path(cfg: dict) -> tuple[list[str], dict]:
+    # Common places for architecture fields in TTS configs.
+    candidates: list[tuple[list[str], dict]] = [
+        ([], cfg),
+        (["talker_config"], cfg.get("talker_config", {})),
+        (["model"], cfg.get("model", {})),
+        (["text_config"], cfg.get("text_config", {})),
+    ]
+    for path, d in candidates:
+        if not isinstance(d, dict):
+            continue
+        has_layers = _pick_key(d, ["num_hidden_layers", "n_layer"]) is not None
+        has_hidden = _pick_key(d, ["hidden_size", "n_embd"]) is not None
+        has_heads = _pick_key(d, ["num_attention_heads", "n_head"]) is not None
+        if has_layers and has_hidden and has_heads:
+            return path, d
+    raise ValueError(
+        "Teacher config does not contain expected layers/hidden/heads fields at top-level or talker_config/model/text_config."
+    )
+
+
 def build_student_config(
     teacher_cfg: dict,
     layer_ratio: float = 0.5,
     hidden_ratio: float = 0.8,
     ffn_ratio: float = 0.8,
-) -> dict:
-    cfg = dict(teacher_cfg)
+) -> tuple[dict, list[str]]:
+    cfg = copy.deepcopy(teacher_cfg)
+    path, model_cfg = _find_model_cfg_path(cfg)
 
-    num_layers_key = "num_hidden_layers" if "num_hidden_layers" in cfg else "n_layer"
-    hidden_key = "hidden_size" if "hidden_size" in cfg else "n_embd"
-    ffn_key = "intermediate_size" if "intermediate_size" in cfg else None
-    heads_key = "num_attention_heads" if "num_attention_heads" in cfg else "n_head"
+    num_layers_key = _pick_key(model_cfg, ["num_hidden_layers", "n_layer"])
+    hidden_key = _pick_key(model_cfg, ["hidden_size", "n_embd"])
+    heads_key = _pick_key(model_cfg, ["num_attention_heads", "n_head"])
+    ffn_key = _pick_key(model_cfg, ["intermediate_size", "ffn_hidden_size", "n_inner"])
 
-    if num_layers_key not in cfg or hidden_key not in cfg or heads_key not in cfg:
+    if num_layers_key is None or hidden_key is None or heads_key is None:
         raise ValueError("Teacher config must include layers/hidden/heads fields.")
 
-    teacher_layers = int(cfg[num_layers_key])
-    teacher_hidden = int(cfg[hidden_key])
-    teacher_heads = int(cfg[heads_key])
+    teacher_layers = int(model_cfg[num_layers_key])
+    teacher_hidden = int(model_cfg[hidden_key])
+    teacher_heads = int(model_cfg[heads_key])
 
     student_layers = max(1, int(round(teacher_layers * layer_ratio)))
     # Keep head_dim close to teacher by shrinking heads with hidden.
@@ -35,25 +64,25 @@ def build_student_config(
     student_heads = max(1, int(round(raw_hidden / teacher_head_dim)))
     student_hidden = _round_to_multiple(raw_hidden, student_heads)
 
-    cfg[num_layers_key] = student_layers
-    cfg[hidden_key] = student_hidden
-    cfg[heads_key] = student_heads
+    model_cfg[num_layers_key] = student_layers
+    model_cfg[hidden_key] = student_hidden
+    model_cfg[heads_key] = student_heads
 
     # Keep kv heads <= attention heads when present.
-    if "num_key_value_heads" in cfg:
-        kv = int(cfg["num_key_value_heads"])
-        cfg["num_key_value_heads"] = min(kv, student_heads)
+    if "num_key_value_heads" in model_cfg:
+        kv = int(model_cfg["num_key_value_heads"])
+        model_cfg["num_key_value_heads"] = min(kv, student_heads)
 
-    if ffn_key is not None and ffn_key in cfg:
-        teacher_ffn = int(cfg[ffn_key])
+    if ffn_key is not None and ffn_key in model_cfg:
+        teacher_ffn = int(model_cfg[ffn_key])
         # Many models prefer FFN multiple of 256.
-        cfg[ffn_key] = _round_to_multiple(max(256, int(round(teacher_ffn * ffn_ratio))), 256)
+        model_cfg[ffn_key] = _round_to_multiple(max(256, int(round(teacher_ffn * ffn_ratio))), 256)
 
     # Optional rope/head consistency fields.
-    if "head_dim" in cfg:
-        cfg["head_dim"] = cfg[hidden_key] // cfg[heads_key]
+    if "head_dim" in model_cfg:
+        model_cfg["head_dim"] = model_cfg[hidden_key] // model_cfg[heads_key]
 
-    return cfg
+    return cfg, path
 
 
 def main() -> None:
@@ -66,7 +95,7 @@ def main() -> None:
     args = p.parse_args()
 
     teacher_cfg = json.loads(Path(args.teacher_config).read_text(encoding="utf-8"))
-    student_cfg = build_student_config(
+    student_cfg, cfg_path = build_student_config(
         teacher_cfg,
         layer_ratio=args.layer_ratio,
         hidden_ratio=args.hidden_ratio,
@@ -77,11 +106,23 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(student_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    src_cfg = teacher_cfg
+    dst_cfg = student_cfg
+    for k in cfg_path:
+        src_cfg = src_cfg[k]
+        dst_cfg = dst_cfg[k]
+
+    layer_key = _pick_key(src_cfg, ["num_hidden_layers", "n_layer"])
+    hidden_key = _pick_key(src_cfg, ["hidden_size", "n_embd"])
+    ffn_key = _pick_key(src_cfg, ["intermediate_size", "ffn_hidden_size", "n_inner"])
+
     print("[OK] student config generated")
-    print(f"layers: {teacher_cfg.get('num_hidden_layers', teacher_cfg.get('n_layer'))} -> {student_cfg.get('num_hidden_layers', student_cfg.get('n_layer'))}")
-    print(f"hidden: {teacher_cfg.get('hidden_size', teacher_cfg.get('n_embd'))} -> {student_cfg.get('hidden_size', student_cfg.get('n_embd'))}")
-    if "intermediate_size" in teacher_cfg:
-        print(f"ffn: {teacher_cfg['intermediate_size']} -> {student_cfg['intermediate_size']}")
+    print(f"config_scope: {'/'.join(cfg_path) if cfg_path else 'root'}")
+    if layer_key and hidden_key:
+        print(f"layers: {src_cfg[layer_key]} -> {dst_cfg[layer_key]}")
+        print(f"hidden: {src_cfg[hidden_key]} -> {dst_cfg[hidden_key]}")
+    if ffn_key and ffn_key in src_cfg:
+        print(f"ffn: {src_cfg[ffn_key]} -> {dst_cfg[ffn_key]}")
 
 
 if __name__ == "__main__":
