@@ -1,10 +1,14 @@
 import argparse
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
+from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 
 
@@ -32,6 +36,84 @@ def _normalize_language(raw: str | None, supported: set[str]) -> str:
         if k.lower() == cand.lower():
             return k
     return "Japanese" if "japanese" in {x.lower() for x in supported} else "Auto"
+
+
+def _sanitize_config_for_qwen3(cfg: dict[str, Any]) -> dict[str, Any]:
+    clean = json.loads(json.dumps(cfg))
+    drop_keys = {"model_type", "dtype", "torch_dtype"}
+
+    def _walk(x: Any) -> Any:
+        if isinstance(x, dict):
+            out = {}
+            for k, v in x.items():
+                if k in drop_keys:
+                    continue
+                out[k] = _walk(v)
+            return out
+        if isinstance(x, list):
+            return [_walk(v) for v in x]
+        return x
+
+    return _walk(clean)
+
+
+def _load_qwen3_model(
+    model_path_or_id: str,
+    device: str,
+    torch_dtype: torch.dtype,
+    attn_impl: str,
+    processor_model: str | None = None,
+):
+    try:
+        return Qwen3TTSModel.from_pretrained(
+            model_path_or_id,
+            device_map=device,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_impl,
+        )
+    except Exception as e:
+        model_dir = Path(model_path_or_id)
+        if not model_dir.exists():
+            raise
+        print(f"[WARN] wrapper load failed for {model_path_or_id}: {e}")
+        print("[INFO] fallback: sanitize config and load core model directly.")
+
+        cfg_path = model_dir / "config.json"
+        raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        clean_cfg = _sanitize_config_for_qwen3(raw_cfg)
+        with tempfile.TemporaryDirectory(prefix="qwen3tts_sanitized_") as td:
+            td_path = Path(td)
+            for item in model_dir.iterdir():
+                if item.name == "config.json":
+                    continue
+                dst = td_path / item.name
+                try:
+                    os.symlink(item, dst, target_is_directory=item.is_dir())
+                except OSError:
+                    import shutil
+
+                    if item.is_dir():
+                        shutil.copytree(item, dst)
+                    else:
+                        shutil.copy2(item, dst)
+            (td_path / "config.json").write_text(
+                json.dumps(clean_cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            cfg_obj = Qwen3TTSConfig(**clean_cfg)
+            core_model = Qwen3TTSForConditionalGeneration.from_pretrained(
+                str(td_path),
+                config=cfg_obj,
+                device_map=device,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_impl,
+            )
+
+        # Processor is usually available in local model dir when copied from base model.
+        from transformers import AutoProcessor
+
+        proc_src = processor_model or model_path_or_id
+        processor = AutoProcessor.from_pretrained(proc_src, fix_mistral_regex=True)
+        return Qwen3TTSModel(model=core_model, processor=processor, generate_defaults={})
 
 
 def _gen_codec_ids_2d(
@@ -92,6 +174,11 @@ def main() -> None:
     p.add_argument("--teacher-codes-jsonl", required=True)
     p.add_argument("--ref-audio", default=None)
     p.add_argument("--ref-text-file", default=None)
+    p.add_argument(
+        "--processor-model",
+        default="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        help="Processor source used in fallback loading.",
+    )
     p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--non-streaming-mode", action="store_true")
     p.add_argument("--device", default=None)
@@ -105,11 +192,12 @@ def main() -> None:
     if args.ref_text_file:
         ref_text = Path(args.ref_text_file).read_text(encoding="utf-8").strip()
 
-    model = Qwen3TTSModel.from_pretrained(
+    model = _load_qwen3_model(
         args.student_model,
-        device_map=device,
+        device=device,
         torch_dtype=dtype,
-        attn_implementation=attn_impl,
+        attn_impl=attn_impl,
+        processor_model=args.processor_model,
     )
 
     rows = _load_jsonl(Path(args.teacher_codes_jsonl))
