@@ -3,7 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from transformers import AutoConfig
+from huggingface_hub import hf_hub_download
 
 
 def run(cmd: list[str]) -> None:
@@ -64,11 +64,11 @@ def main() -> None:
         if tm.exists() and tm.is_dir() and (tm / "config.json").exists():
             teacher_config = str(tm / "config.json")
         else:
-            # Resolve config from HF model id (or local model path) and materialize it for step-00.
-            cfg = AutoConfig.from_pretrained(args.teacher_model, trust_remote_code=True)
-            resolved_cfg_path = root / "teacher_config.resolved.json"
-            resolved_cfg_path.write_text(cfg.to_json_string(use_diff=False), encoding="utf-8")
-            teacher_config = str(resolved_cfg_path)
+            # Resolve config.json directly from HF hub without model-type parsing.
+            teacher_config = hf_hub_download(
+                repo_id=args.teacher_model,
+                filename="config.json",
+            )
 
     ref_text_file = Path(args.ref_text_file)
     ref_text = ref_text_file.read_text(encoding="utf-8").strip() if ref_text_file.exists() else None
