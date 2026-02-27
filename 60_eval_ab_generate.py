@@ -79,21 +79,27 @@ def _gen_one(
 
 def _sanitize_config_for_qwen3(cfg: dict[str, Any]) -> dict[str, Any]:
     clean = json.loads(json.dumps(cfg))
-    drop_keys = {"model_type", "dtype", "torch_dtype"}
+    root_model_type = clean.get("model_type", None)
+    drop_keys = {"dtype", "torch_dtype"}
 
-    def _walk(x: Any) -> Any:
+    def _walk(x: Any, depth: int = 0) -> Any:
         if isinstance(x, dict):
             out = {}
             for k, v in x.items():
                 if k in drop_keys:
                     continue
-                out[k] = _walk(v)
+                if k == "model_type" and depth > 0:
+                    continue
+                out[k] = _walk(v, depth + 1)
             return out
         if isinstance(x, list):
-            return [_walk(v) for v in x]
+            return [_walk(v, depth + 1) for v in x]
         return x
 
-    return _walk(clean)
+    sanitized = _walk(clean, 0)
+    if root_model_type and "model_type" not in sanitized:
+        sanitized["model_type"] = root_model_type
+    return sanitized
 
 
 def _load_qwen3_model(
