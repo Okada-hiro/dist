@@ -73,18 +73,23 @@ def _gen_one(
     return wavs, sr
 
 
-def _sanitize_nested_model_type(cfg: dict[str, Any]) -> dict[str, Any]:
+def _sanitize_config_for_qwen3(cfg: dict[str, Any]) -> dict[str, Any]:
     clean = json.loads(json.dumps(cfg))
-    for top_key in ("talker_config", "speaker_encoder_config"):
-        sub = clean.get(top_key)
-        if isinstance(sub, dict):
-            sub.pop("model_type", None)
-    tcfg = clean.get("talker_config")
-    if isinstance(tcfg, dict):
-        cp = tcfg.get("code_predictor_config")
-        if isinstance(cp, dict):
-            cp.pop("model_type", None)
-    return clean
+    drop_keys = {"model_type", "dtype", "torch_dtype"}
+
+    def _walk(x: Any) -> Any:
+        if isinstance(x, dict):
+            out = {}
+            for k, v in x.items():
+                if k in drop_keys:
+                    continue
+                out[k] = _walk(v)
+            return out
+        if isinstance(x, list):
+            return [_walk(v) for v in x]
+        return x
+
+    return _walk(clean)
 
 
 def _load_qwen3_model(
@@ -116,7 +121,7 @@ def _load_qwen3_model(
             if not cfg_path.exists():
                 raise
             raw_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            clean_cfg = _sanitize_nested_model_type(raw_cfg)
+            clean_cfg = _sanitize_config_for_qwen3(raw_cfg)
             # Qwen3TTSForConditionalGeneration.from_pretrained() still reads config.json internally.
             # Create a sanitized temp model dir and point loading there.
             with tempfile.TemporaryDirectory(prefix="qwen3tts_sanitized_") as td:
