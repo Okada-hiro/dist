@@ -1,5 +1,6 @@
 import argparse
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -7,12 +8,65 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 import torch
+from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration, mel_spectrogram
+
+
+def _copy_aux_runtime_files(src_dir: Path, out_dir: Path) -> None:
+    if not src_dir.exists() or not src_dir.is_dir():
+        return
+    skip = {
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+    }
+    for p in src_dir.iterdir():
+        name = p.name
+        if name in skip or name.startswith("model-"):
+            continue
+        dst = out_dir / name
+        if dst.exists():
+            continue
+        if p.is_dir():
+            shutil.copytree(p, dst)
+        else:
+            shutil.copy2(p, dst)
+
+
+def _save_model_robust(model: Qwen3TTSForConditionalGeneration, out_dir: Path, init_model: str | None) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        model.save_pretrained(str(out_dir), safe_serialization=True)
+        print(f"[DONE] training finished. model saved -> {out_dir}")
+        return
+    except Exception as e:
+        print(f"[WARN] save_pretrained failed, fallback save will be used: {e}")
+
+    # Fallback: save a single safetensors + full config JSON.
+    state_dict = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    save_file(state_dict, str(out_dir / "model.safetensors"))
+    cfg = model.config.to_dict()
+    for k in ("talker_config", "speaker_encoder_config"):
+        if isinstance(cfg.get(k), dict):
+            cfg[k].pop("model_type", None)
+    tc = cfg.get("talker_config")
+    if isinstance(tc, dict) and isinstance(tc.get("code_predictor_config"), dict):
+        tc["code_predictor_config"].pop("model_type", None)
+    (out_dir / "config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.save_pretrained(str(out_dir))
+
+    if init_model:
+        src = Path(init_model)
+        if src.exists() and src.is_dir():
+            _copy_aux_runtime_files(src, out_dir)
+    print(f"[DONE] training finished. model saved (fallback) -> {out_dir}")
 
 
 def _to_int_list(x: Any) -> list[int]:
@@ -506,8 +560,7 @@ def main() -> None:
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
 
-    model.save_pretrained(str(out_dir), safe_serialization=True)
-    print(f"[DONE] training finished. model saved -> {out_dir}")
+    _save_model_robust(model, out_dir, args.init_model)
 
 
 if __name__ == "__main__":
