@@ -105,6 +105,7 @@ class DistillJsonlDataset(Dataset):
 @dataclass
 class DistillCollator:
     pad_token_id: int
+    max_codec_len: int | None = None
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         seqs = []
@@ -114,6 +115,8 @@ class DistillCollator:
             codec_ids = _to_int_list(row.get("codec_ids", row.get("codes")))
             if codec_ids is None:
                 continue
+            if self.max_codec_len is not None and self.max_codec_len > 0:
+                codec_ids = codec_ids[: self.max_codec_len]
             if len(codec_ids) < 2:
                 continue
 
@@ -221,12 +224,32 @@ def main() -> None:
     p.add_argument("--grad-accum", type=int, default=8)
     p.add_argument("--max-steps", type=int, default=-1)
     p.add_argument("--dry-run-only", action="store_true", help="Run one forward/backward sanity check and exit.")
+    p.add_argument("--max-codec-len", type=int, default=None, help="Truncate codec_ids length per sample to reduce VRAM.")
+    p.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to reduce VRAM.")
     args = p.parse_args()
 
     # Student config is a local json produced by 00_make_student_config.py.
     cfg_dict = json.loads(Path(args.student_config).read_text(encoding="utf-8"))
     student_cfg = Qwen3TTSConfig(**cfg_dict)
     model = Qwen3TTSForConditionalGeneration(student_cfg)
+    if args.gradient_checkpointing:
+        enabled = False
+        try:
+            model.talker.gradient_checkpointing_enable()
+            enabled = True
+        except Exception:
+            pass
+        try:
+            model.talker.model.gradient_checkpointing = True
+            enabled = True
+        except Exception:
+            pass
+        try:
+            model.talker.code_predictor.gradient_checkpointing_enable()
+            enabled = True
+        except Exception:
+            pass
+        print(f"[INFO] gradient_checkpointing={'enabled' if enabled else 'requested_but_not_applied'}")
 
     pad_token_id = args.pad_token_id if args.pad_token_id is not None else 2150
 
@@ -243,7 +266,9 @@ def main() -> None:
             f"[INFO] eval rows: {len(eval_ds)}"
             + (f" (skipped={eval_ds.skipped})" if getattr(eval_ds, "skipped", 0) else "")
         )
-    collator = DistillCollator(pad_token_id=pad_token_id)
+    collator = DistillCollator(pad_token_id=pad_token_id, max_codec_len=args.max_codec_len)
+    if args.max_codec_len is not None:
+        print(f"[INFO] max_codec_len={args.max_codec_len}")
 
     # Sanity: model init + single forward/backward before full train.
     sample_batch = collator([train_ds[0]])
