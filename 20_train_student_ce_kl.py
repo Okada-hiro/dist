@@ -336,6 +336,11 @@ def main() -> None:
     p.add_argument("--teacher-model", default=None, help="Accepted for CLI compatibility; unused in this script.")
     p.add_argument("--kl-alpha", type=float, default=0.0, help="Accepted for CLI compatibility; KL is not used.")
     p.add_argument("--student-config", required=True)
+    p.add_argument(
+        "--init-model",
+        default=None,
+        help="Optional model dir/HF id to initialize weights from (must match student-config shape).",
+    )
     p.add_argument("--train-jsonl", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--epochs", type=float, default=1.0)
@@ -366,7 +371,34 @@ def main() -> None:
     args = p.parse_args()
 
     cfg_dict = json.loads(Path(args.student_config).read_text(encoding="utf-8"))
-    model = Qwen3TTSForConditionalGeneration(Qwen3TTSConfig(**cfg_dict))
+    student_cfg = Qwen3TTSConfig(**cfg_dict)
+    if args.init_model:
+        print(f"[INFO] model init source: pretrained ({args.init_model})")
+        model = Qwen3TTSForConditionalGeneration.from_pretrained(
+            args.init_model,
+            torch_dtype=torch.float32,
+        )
+        # Safety check: fail fast on config mismatch.
+        c = model.config.talker_config
+        s = student_cfg.talker_config
+        mismatch = []
+        for k in (
+            "num_hidden_layers",
+            "hidden_size",
+            "intermediate_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "num_code_groups",
+        ):
+            if int(getattr(c, k)) != int(getattr(s, k)):
+                mismatch.append(f"{k}: loaded={getattr(c, k)} student_cfg={getattr(s, k)}")
+        if mismatch:
+            raise ValueError(
+                "init-model and student-config mismatch:\n" + "\n".join(mismatch)
+            )
+    else:
+        print("[INFO] model init source: random (from student-config)")
+        model = Qwen3TTSForConditionalGeneration(student_cfg)
 
     if args.gradient_checkpointing:
         enabled = False
