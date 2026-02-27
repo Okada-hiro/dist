@@ -64,8 +64,12 @@ class DistillCollator:
         teacher_topk = []
 
         for row in features:
-            text_ids = row["text_input_ids"]
-            codec_ids = row["codec_ids"]
+            text_ids = row.get("text_input_ids", row.get("input_ids", row.get("text_ids")))
+            codec_ids = row.get("codec_ids", row.get("codes"))
+            if text_ids is None or codec_ids is None:
+                continue
+            if len(text_ids) == 0 or len(codec_ids) == 0:
+                continue
 
             input_ids = text_ids + [self.bridge_token_id] + codec_ids
             lab = ([-100] * (len(text_ids) + 1)) + codec_ids
@@ -73,6 +77,9 @@ class DistillCollator:
             seqs.append(torch.tensor(input_ids, dtype=torch.long))
             labels.append(torch.tensor(lab, dtype=torch.long))
             teacher_topk.append(row.get("teacher_topk"))
+
+        if not seqs:
+            raise ValueError("Batch has no valid samples. Check keys: text_input_ids/codec_ids in train jsonl.")
 
         input_ids = torch.nn.utils.rnn.pad_sequence(
             seqs, batch_first=True, padding_value=self.pad_token_id
@@ -180,6 +187,8 @@ def main() -> None:
         f"[INFO] train rows: {len(train_ds)}"
         + (f" (skipped={train_ds.skipped})" if getattr(train_ds, "skipped", 0) else "")
     )
+    if len(train_ds) > 0:
+        print(f"[INFO] sample train keys: {sorted(train_ds[0].keys())}")
     if eval_ds is not None:
         print(
             f"[INFO] eval rows: {len(eval_ds)}"
@@ -201,6 +210,7 @@ def main() -> None:
         max_steps=args.max_steps,
         bf16=torch.cuda.is_available(),
         fp16=False,
+        remove_unused_columns=False,
         report_to=[],
     )
 
