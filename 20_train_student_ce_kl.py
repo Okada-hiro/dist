@@ -2,18 +2,15 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import Trainer, TrainingArguments
+
+from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
+from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
 
 
 class DistillJsonlDataset(Dataset):
@@ -144,19 +141,15 @@ def main() -> None:
     p.add_argument("--max-steps", type=int, default=-1)
     args = p.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
-    pad_token_id = args.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = tokenizer.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = tokenizer.eos_token_id
+    # Student config is a local json produced by 00_make_student_config.py.
+    cfg_dict = json.loads(Path(args.student_config).read_text(encoding="utf-8"))
+    student_cfg = Qwen3TTSConfig(**cfg_dict)
+    model = Qwen3TTSForConditionalGeneration(student_cfg)
 
-    bridge_token_id = args.bridge_token_id
-    if bridge_token_id is None:
-        bridge_token_id = tokenizer.eos_token_id
-
-    student_cfg = AutoConfig.from_pretrained(args.student_config, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_config(student_cfg, trust_remote_code=True)
+    # We use pre-tokenized ids from teacher data.
+    # Keep defaults compatible with observed Qwen3-TTS tokenizer ids.
+    pad_token_id = args.pad_token_id if args.pad_token_id is not None else 2150
+    bridge_token_id = args.bridge_token_id if args.bridge_token_id is not None else 2150
 
     train_ds = DistillJsonlDataset(args.train_jsonl)
     eval_ds = DistillJsonlDataset(args.eval_jsonl) if args.eval_jsonl else None
