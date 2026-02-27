@@ -37,6 +37,11 @@ def main() -> None:
     p.add_argument("--x-vector-only", action="store_true")
     p.add_argument("--non-streaming-mode", action="store_true")
     p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument(
+        "--save-teacher-artifacts",
+        action="store_true",
+        help="Save teacher wav/codec artifacts under <work-dir>/teacher_artifacts",
+    )
 
     # Training options
     p.add_argument("--kl-alpha", type=float, default=0.0)
@@ -105,6 +110,8 @@ def main() -> None:
         cmd_build.append("--x-vector-only")
     if args.non_streaming_mode:
         cmd_build.append("--non-streaming-mode")
+    if args.save_teacher_artifacts:
+        cmd_build += ["--save-artifacts-dir", str(root / "teacher_artifacts")]
     run(cmd_build)
 
     run(

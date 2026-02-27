@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import soundfile as sf
 import torch
 from tqdm import tqdm
 
@@ -40,6 +41,11 @@ def main() -> None:
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=50)
+    p.add_argument(
+        "--save-artifacts-dir",
+        default=None,
+        help="Optional dir to save per-sample teacher artifacts (*.wav, *.codec_ids.json, metadata.jsonl)",
+    )
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -55,10 +61,15 @@ def main() -> None:
 
     rows = _load_jsonl(Path(args.input_jsonl))
     out_rows: list[dict[str, Any]] = []
+    artifacts_dir = Path(args.save_artifacts_dir) if args.save_artifacts_dir else None
+    artifact_meta_rows: list[dict[str, Any]] = []
+    if artifacts_dir is not None:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    for row in tqdm(rows, desc="build_teacher_codes"):
+    for idx, row in enumerate(tqdm(rows, desc="build_teacher_codes")):
         text = row["text"]
         language = row.get("language", "ja")
+        sid = str(row.get("id", f"{idx:06d}"))
 
         # Keep this aligned with inference implementation.
         input_ids = teacher._tokenize_texts([teacher._build_assistant_text(text)])
@@ -93,7 +104,7 @@ def main() -> None:
 
         out_rows.append(
             {
-                "id": row.get("id"),
+                "id": sid,
                 "text": text,
                 "language": language,
                 "text_input_ids": text_input_ids,
@@ -101,7 +112,33 @@ def main() -> None:
             }
         )
 
+        if artifacts_dir is not None:
+            codec_tensor = talker_codes_list[0].detach().cpu().to(torch.long)
+            wavs, sr = teacher.model.speech_tokenizer.decode([{"audio_codes": codec_tensor}])
+            wav = wavs[0]
+
+            wav_path = artifacts_dir / f"{sid}.teacher.wav"
+            codec_path = artifacts_dir / f"{sid}.codec_ids.json"
+            sf.write(str(wav_path), wav, sr)
+            codec_path.write_text(json.dumps(codec_ids, ensure_ascii=False), encoding="utf-8")
+
+            artifact_meta_rows.append(
+                {
+                    "id": sid,
+                    "text": text,
+                    "language": language,
+                    "wav_path": str(wav_path),
+                    "codec_path": str(codec_path),
+                    "codec_len": int(len(codec_ids)),
+                    "sample_rate": int(sr),
+                }
+            )
+
     _write_jsonl(Path(args.output_jsonl), out_rows)
+    if artifacts_dir is not None:
+        meta_path = artifacts_dir / "metadata.jsonl"
+        _write_jsonl(meta_path, artifact_meta_rows)
+        print(f"[OK] artifacts saved -> {artifacts_dir}")
     print(f"[OK] wrote {len(out_rows)} samples -> {args.output_jsonl}")
 
 
