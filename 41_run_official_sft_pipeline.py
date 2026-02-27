@@ -23,15 +23,40 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--num-epochs", type=int, default=3)
+    p.add_argument(
+        "--finetuning-dir",
+        default=None,
+        help="Path to finetuning directory (contains prepare_data.py and sft_12hz.py). "
+             "If omitted, auto-detect from current cwd/script location.",
+    )
     args = p.parse_args()
 
     py = sys.executable
-    repo_root = Path(".").resolve()
+    script_dir = Path(__file__).resolve().parent
+
+    if args.finetuning_dir:
+        finetuning_dir = Path(args.finetuning_dir).resolve()
+    else:
+        candidates = [
+            Path(".").resolve() / "finetuning",
+            script_dir.parent / "finetuning",
+            script_dir / "finetuning",
+        ]
+        finetuning_dir = None
+        for c in candidates:
+            if (c / "prepare_data.py").exists() and (c / "sft_12hz.py").exists():
+                finetuning_dir = c
+                break
+        if finetuning_dir is None:
+            raise FileNotFoundError(
+                "Could not find finetuning directory. "
+                "Pass --finetuning-dir explicitly."
+            )
 
     run(
         [
             py,
-            str(repo_root / "finetuning" / "prepare_data.py"),
+            str(finetuning_dir / "prepare_data.py"),
             "--device",
             args.device,
             "--tokenizer_model_path",
@@ -46,7 +71,7 @@ def main() -> None:
     run(
         [
             py,
-            str(repo_root / "finetuning" / "sft_12hz.py"),
+            str(finetuning_dir / "sft_12hz.py"),
             "--init_model_path",
             args.init_model_path,
             "--output_model_path",
@@ -65,6 +90,7 @@ def main() -> None:
     )
 
     print("[OK] official sft pipeline completed")
+    print(f"  finetuning_dir   : {finetuning_dir}")
     print(f"  raw_jsonl        : {args.train_raw_jsonl}")
     print(f"  train_with_codes : {args.train_with_codes_jsonl}")
     print(f"  output_model     : {args.output_model_path}")
@@ -72,4 +98,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
