@@ -128,6 +128,7 @@ def _gen_codec_ids_2d(
     language: str,
     ref_audio: str | None,
     ref_text: str | None,
+    x_vector_only_mode: bool,
     non_streaming_mode: bool,
     max_new_tokens: int,
 ) -> list[list[int]]:
@@ -136,7 +137,7 @@ def _gen_codec_ids_2d(
         prompt = model.create_voice_clone_prompt(
             ref_audio=ref_audio,
             ref_text=ref_text,
-            x_vector_only_mode=False,
+            x_vector_only_mode=x_vector_only_mode,
         )
 
     input_ids = model._tokenize_texts([model._build_assistant_text(text)])
@@ -180,6 +181,11 @@ def main() -> None:
     p.add_argument("--teacher-codes-jsonl", required=True)
     p.add_argument("--ref-audio", default=None)
     p.add_argument("--ref-text-file", default=None)
+    p.add_argument(
+        "--x-vector-only",
+        action="store_true",
+        help="Use speaker embedding only (disable ICL ref_code path).",
+    )
     p.add_argument(
         "--processor-model",
         default="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
@@ -230,6 +236,7 @@ def main() -> None:
             language=language,
             ref_audio=args.ref_audio,
             ref_text=ref_text,
+            x_vector_only_mode=args.x_vector_only,
             non_streaming_mode=args.non_streaming_mode,
             max_new_tokens=args.max_new_tokens,
         )

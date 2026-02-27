@@ -55,6 +55,7 @@ def _gen_one(
     language: str,
     ref_audio: str,
     ref_text: str,
+    x_vector_only_mode: bool,
     max_new_tokens: int,
     do_sample: bool,
     top_k: int,
@@ -66,7 +67,7 @@ def _gen_one(
         language=language,
         ref_audio=ref_audio,
         ref_text=ref_text,
-        x_vector_only_mode=False,
+        x_vector_only_mode=x_vector_only_mode,
         non_streaming_mode=True,
         do_sample=do_sample,
         top_k=top_k,
@@ -178,6 +179,11 @@ def main() -> None:
     p.add_argument("--input-jsonl", required=True, help="Input texts jsonl (id,text,language optional)")
     p.add_argument("--ref-audio", required=True)
     p.add_argument("--ref-text-file", required=True)
+    p.add_argument(
+        "--x-vector-only",
+        action="store_true",
+        help="Use speaker embedding only (disable ICL ref_code path).",
+    )
     p.add_argument("--out-dir", default="dist/eval_ab")
     p.add_argument("--default-language", default="Japanese")
     p.add_argument("--max-new-tokens", type=int, default=1024)
@@ -222,6 +228,7 @@ def main() -> None:
             language,
             args.ref_audio,
             ref_text,
+            args.x_vector_only,
             args.max_new_tokens,
             args.do_sample,
             args.top_k,
@@ -237,6 +244,7 @@ def main() -> None:
             language,
             args.ref_audio,
             ref_text,
+            args.x_vector_only,
             args.max_new_tokens,
             args.do_sample,
             args.top_k,
