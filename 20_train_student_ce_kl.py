@@ -196,19 +196,45 @@ class QwenLikeCollator:
     max_codec_len: int | None = None
     fixed_spk_id: int = 0
 
+    def _resolve_language_id(self, raw_language: Any) -> int | None:
+        lang_map = getattr(self.config.talker_config, "codec_language_id", None) or {}
+        if not lang_map:
+            return None
+        if raw_language is None:
+            return None
+        s = str(raw_language).strip()
+        if not s:
+            return None
+        if s.lower() == "auto":
+            return None
+        low = s.lower()
+        alias = {"ja": "japanese", "japanese": "japanese", "en": "english", "zh": "chinese"}
+        cand = alias.get(low, low)
+        for k, v in lang_map.items():
+            if str(k).lower() == cand:
+                return int(v)
+        return None
+
     def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         b = len(batch)
         g = int(self.config.talker_config.num_code_groups)
+        role_len = 3
 
         text_ids_list = [torch.tensor(x["text_input_ids"], dtype=torch.long) for x in batch]
         codec_2d_list = []
+        language_ids: list[int | None] = []
         for x in batch:
             c = x["codec_ids_2d"]
             if self.max_codec_len is not None and self.max_codec_len > 0:
                 c = c[: self.max_codec_len]
             codec_2d_list.append(torch.tensor(c, dtype=torch.long))
+            language_ids.append(self._resolve_language_id(x.get("language")))
 
-        lens = [t.shape[0] + c.shape[0] for t, c in zip(text_ids_list, codec_2d_list)]
+        lens = []
+        for t, c, lang_id in zip(text_ids_list, codec_2d_list, language_ids):
+            prefill_core_len = 3 if lang_id is None else 4
+            base = role_len + prefill_core_len + 2  # 8(auto) / 9(language-specific)
+            lens.append(t.shape[0] + c.shape[0] + (base - 8))
         max_len = max(lens) + 8
 
         input_ids = torch.zeros((b, max_len, 2), dtype=torch.long)
@@ -218,55 +244,75 @@ class QwenLikeCollator:
         codec_mask = torch.zeros((b, max_len), dtype=torch.bool)
         attention_mask = torch.zeros((b, max_len), dtype=torch.long)
         codec_0_labels = torch.full((b, max_len), -100, dtype=torch.long)
+        speaker_pos = torch.zeros((b,), dtype=torch.long)
 
         for i in range(b):
             text_ids = text_ids_list[i]
             codes = codec_2d_list[i]
+            lang_id = language_ids[i]
             if codes.ndim != 2 or codes.shape[1] != g:
                 raise ValueError(f"codec shape mismatch at i={i}: got {tuple(codes.shape)}, expected (*,{g})")
 
             audio_codec_0 = codes[:, 0]
             text_len = text_ids.shape[0]
             codec_len = audio_codec_0.shape[0]
+            prefill_core_len = 3 if lang_id is None else 4
+            # Talker prefix length before first trailing text token:
+            # role(3) + [core + speaker + codec_pad] = role + core + 2
+            base = role_len + prefill_core_len + 2
+            text_tail_len = text_len - 3
+            text_eos_pos = base + text_tail_len
+            codec_bos_pos = text_eos_pos + 1
+            audio_start = codec_bos_pos + 1
+            audio_end = audio_start + codec_len
+            codec_eos_pos = audio_end
 
             # text channel
-            input_ids[i, :3, 0] = text_ids[:3]
-            input_ids[i, 3:7, 0] = self.config.tts_pad_token_id
-            input_ids[i, 7, 0] = self.config.tts_bos_token_id
+            input_ids[i, :role_len, 0] = text_ids[:role_len]
+            pad_count = prefill_core_len + 1
+            input_ids[i, role_len : role_len + pad_count, 0] = self.config.tts_pad_token_id
+            input_ids[i, role_len + pad_count, 0] = self.config.tts_bos_token_id
             if text_len > 3:
-                input_ids[i, 8 : 8 + text_len - 3, 0] = text_ids[3:]
-            input_ids[i, 8 + text_len - 3, 0] = self.config.tts_eos_token_id
-            input_ids[i, 8 + text_len - 2 : 8 + text_len + codec_len, 0] = self.config.tts_pad_token_id
-            text_embedding_mask[i, : 8 + text_len + codec_len] = True
+                input_ids[i, base : base + text_tail_len, 0] = text_ids[3:]
+            input_ids[i, text_eos_pos, 0] = self.config.tts_eos_token_id
+            input_ids[i, codec_bos_pos : codec_eos_pos + 1, 0] = self.config.tts_pad_token_id
+            text_embedding_mask[i, : codec_eos_pos + 1] = True
 
             # codec channel
-            input_ids[i, 3:8, 1] = torch.tensor(
-                [
+            if lang_id is None:
+                codec_prefill = [
                     self.config.talker_config.codec_nothink_id,
                     self.config.talker_config.codec_think_bos_id,
                     self.config.talker_config.codec_think_eos_id,
-                    int(self.fixed_spk_id),  # fixed speaker embedding token id
-                    self.config.talker_config.codec_pad_id,
-                ],
-                dtype=torch.long,
-            )
+                ]
+            else:
+                codec_prefill = [
+                    self.config.talker_config.codec_think_id,
+                    self.config.talker_config.codec_think_bos_id,
+                    int(lang_id),
+                    self.config.talker_config.codec_think_eos_id,
+                ]
+            codec_prefill += [int(self.fixed_spk_id), self.config.talker_config.codec_pad_id]
+            input_ids[i, role_len : role_len + len(codec_prefill), 1] = torch.tensor(codec_prefill, dtype=torch.long)
+            speaker_pos[i] = role_len + prefill_core_len
+
             if text_len > 3:
-                input_ids[i, 8 : 8 + text_len - 3, 1] = self.config.talker_config.codec_pad_id
-            input_ids[i, 8 + text_len - 3, 1] = self.config.talker_config.codec_pad_id
-            input_ids[i, 8 + text_len - 2, 1] = self.config.talker_config.codec_bos_id
-            input_ids[i, 8 + text_len - 1 : 8 + text_len - 1 + codec_len, 1] = audio_codec_0
-            input_ids[i, 8 + text_len - 1 + codec_len, 1] = self.config.talker_config.codec_eos_token_id
+                input_ids[i, base : base + text_tail_len, 1] = self.config.talker_config.codec_pad_id
+            input_ids[i, text_eos_pos, 1] = self.config.talker_config.codec_pad_id
+            input_ids[i, codec_bos_pos, 1] = self.config.talker_config.codec_bos_id
+            input_ids[i, audio_start:audio_end, 1] = audio_codec_0
+            input_ids[i, codec_eos_pos, 1] = self.config.talker_config.codec_eos_token_id
 
-            codec_0_labels[i, 8 + text_len - 1 : 8 + text_len - 1 + codec_len] = audio_codec_0
-            codec_0_labels[i, 8 + text_len - 1 + codec_len] = self.config.talker_config.codec_eos_token_id
+            codec_0_labels[i, audio_start:audio_end] = audio_codec_0
+            codec_0_labels[i, codec_eos_pos] = self.config.talker_config.codec_eos_token_id
 
-            codec_ids[i, 8 + text_len - 1 : 8 + text_len - 1 + codec_len, :] = codes
+            codec_ids[i, audio_start:audio_end, :] = codes
 
-            codec_embedding_mask[i, 3 : 8 + text_len + codec_len] = True
-            # Slot 6 is reserved for explicit speaker embedding injection.
-            codec_embedding_mask[i, 6] = False
-            codec_mask[i, 8 + text_len - 1 : 8 + text_len - 1 + codec_len] = True
-            attention_mask[i, : 8 + text_len + codec_len] = 1
+            codec_embedding_mask[i, role_len : codec_eos_pos + 1] = True
+            # Speaker slot is overwritten by fixed embedding in forward.
+            codec_embedding_mask[i, int(speaker_pos[i].item())] = False
+            codec_mask[i, audio_start:audio_end] = True
+            attention_mask[i, : codec_eos_pos + 1] = 1
 
         return {
             "input_ids": input_ids,
@@ -276,6 +322,7 @@ class QwenLikeCollator:
             "codec_embedding_mask": codec_embedding_mask.unsqueeze(-1),
             "codec_0_labels": codec_0_labels,
             "codec_mask": codec_mask,
+            "speaker_pos": speaker_pos,
         }
 
 
@@ -370,13 +417,15 @@ def _build_forward_inputs(
     attention_mask = batch["attention_mask"]
     codec_0_labels = batch["codec_0_labels"]
     codec_mask = batch["codec_mask"]
+    speaker_pos = batch["speaker_pos"]
 
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
     input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
     input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-    spk = fixed_speaker_embedding.to(input_codec_embedding.device).to(input_codec_embedding.dtype).view(1, 1, -1)
-    input_codec_embedding[:, 6, :] = spk
+    spk = fixed_speaker_embedding.to(input_codec_embedding.device).to(input_codec_embedding.dtype).view(1, -1)
+    row = torch.arange(input_codec_embedding.shape[0], device=input_codec_embedding.device)
+    input_codec_embedding[row, speaker_pos.to(input_codec_embedding.device), :] = spk.expand(input_codec_embedding.shape[0], -1)
     input_embeddings = input_text_embedding + input_codec_embedding
 
     for i in range(1, int(model.talker.config.num_code_groups)):
