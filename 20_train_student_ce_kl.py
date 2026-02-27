@@ -16,12 +16,35 @@ from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGenera
 class DistillJsonlDataset(Dataset):
     def __init__(self, path: str):
         self.rows = []
+        self.skipped = 0
         with Path(path).open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                self.rows.append(json.loads(line))
+                row = json.loads(line)
+
+                # Accept a few legacy/alternative key names.
+                if "text_input_ids" not in row:
+                    if "input_ids" in row and isinstance(row["input_ids"], list):
+                        row["text_input_ids"] = row["input_ids"]
+                    elif "text_ids" in row and isinstance(row["text_ids"], list):
+                        row["text_input_ids"] = row["text_ids"]
+
+                if "codec_ids" not in row:
+                    if "codes" in row and isinstance(row["codes"], list):
+                        row["codec_ids"] = row["codes"]
+
+                if "text_input_ids" not in row or "codec_ids" not in row:
+                    self.skipped += 1
+                    continue
+
+                self.rows.append(row)
+
+        if len(self.rows) == 0:
+            raise ValueError(
+                f"No valid rows in {path}. Expected keys include text_input_ids and codec_ids."
+            )
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -153,6 +176,15 @@ def main() -> None:
 
     train_ds = DistillJsonlDataset(args.train_jsonl)
     eval_ds = DistillJsonlDataset(args.eval_jsonl) if args.eval_jsonl else None
+    print(
+        f"[INFO] train rows: {len(train_ds)}"
+        + (f" (skipped={train_ds.skipped})" if getattr(train_ds, "skipped", 0) else "")
+    )
+    if eval_ds is not None:
+        print(
+            f"[INFO] eval rows: {len(eval_ds)}"
+            + (f" (skipped={eval_ds.skipped})" if getattr(eval_ds, "skipped", 0) else "")
+        )
     collator = DistillCollator(bridge_token_id=bridge_token_id, pad_token_id=pad_token_id)
 
     targs = TrainingArguments(
