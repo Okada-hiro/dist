@@ -28,6 +28,49 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
+def _normalize_language(raw_lang: str, supported_keys: set[str]) -> str:
+    # Keep "Auto" if possible.
+    if "auto" in supported_keys:
+        auto_value = "Auto"
+    else:
+        auto_value = next(iter(supported_keys)) if supported_keys else "Auto"
+
+    if raw_lang is None:
+        return auto_value
+
+    s = str(raw_lang).strip()
+    if not s:
+        return auto_value
+
+    # Exact pass-through.
+    if s in supported_keys:
+        return s
+    low = s.lower()
+    # Case-insensitive exact match with original key retained.
+    for k in supported_keys:
+        if k.lower() == low:
+            return k
+
+    # Common aliases.
+    alias = {
+        "ja": "Japanese",
+        "jp": "Japanese",
+        "jpn": "Japanese",
+        "en": "English",
+        "zh": "Chinese",
+    }
+    mapped = alias.get(low, s)
+    if mapped in supported_keys:
+        return mapped
+    # Case-insensitive alias match with original key retained.
+    for k in supported_keys:
+        if k.lower() == mapped.lower():
+            return k
+
+    # Fallback for unknown labels.
+    return auto_value
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--teacher-model", required=True, help="HF model id/path for Qwen3-TTS teacher")
@@ -60,6 +103,12 @@ def main() -> None:
         )
 
     rows = _load_jsonl(Path(args.input_jsonl))
+    cfg_lang = getattr(getattr(teacher.model.config, "talker_config", None), "codec_language_id", None)
+    supported_lang_keys = set((cfg_lang or {}).keys())
+    if supported_lang_keys:
+        print(f"[INFO] supported languages: {sorted(supported_lang_keys)}")
+    else:
+        print("[INFO] supported languages: <unknown> (fallback to Auto)")
     out_rows: list[dict[str, Any]] = []
     artifacts_dir = Path(args.save_artifacts_dir) if args.save_artifacts_dir else None
     artifact_meta_rows: list[dict[str, Any]] = []
@@ -68,7 +117,7 @@ def main() -> None:
 
     for idx, row in enumerate(tqdm(rows, desc="build_teacher_codes")):
         text = row["text"]
-        language = row.get("language", "ja")
+        language = _normalize_language(row.get("language", "Auto"), supported_lang_keys)
         sid = str(row.get("id", f"{idx:06d}"))
 
         # Keep this aligned with inference implementation.
