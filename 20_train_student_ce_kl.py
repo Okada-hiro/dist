@@ -226,6 +226,13 @@ def main() -> None:
     p.add_argument("--dry-run-only", action="store_true", help="Run one forward/backward sanity check and exit.")
     p.add_argument("--max-codec-len", type=int, default=None, help="Truncate codec_ids length per sample to reduce VRAM.")
     p.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing to reduce VRAM.")
+    p.add_argument(
+        "--save-strategy",
+        choices=["no", "steps", "epoch"],
+        default="no",
+        help="Checkpoint strategy. Default 'no' avoids optimizer checkpoint I/O failures on small disks.",
+    )
+    p.add_argument("--save-steps", type=int, default=200)
     args = p.parse_args()
 
     # Student config is a local json produced by 00_make_student_config.py.
@@ -296,7 +303,9 @@ def main() -> None:
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         logging_steps=20,
-        save_steps=200,
+        save_strategy=args.save_strategy,
+        save_steps=args.save_steps if args.save_strategy == "steps" else None,
+        save_only_model=True,
         eval_strategy="steps" if eval_ds is not None else "no",
         eval_steps=200 if eval_ds is not None else None,
         max_steps=args.max_steps,
