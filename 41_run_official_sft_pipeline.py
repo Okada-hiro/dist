@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from huggingface_hub import snapshot_download
+
 
 def run(cmd: list[str]) -> None:
     print("[RUN]", " ".join(cmd))
@@ -53,6 +55,14 @@ def main() -> None:
                 "Pass --finetuning-dir explicitly."
             )
 
+    # sft_12hz.py uses shutil.copytree(MODEL_PATH, ...), so MODEL_PATH must be a local directory.
+    init_model_path = args.init_model_path
+    init_model_dir = Path(init_model_path)
+    if not init_model_dir.exists():
+        print(f"[INFO] resolving HF model to local snapshot: {init_model_path}")
+        init_model_path = snapshot_download(repo_id=init_model_path)
+        print(f"[INFO] local init model path: {init_model_path}")
+
     run(
         [
             py,
@@ -73,7 +83,7 @@ def main() -> None:
             py,
             str(finetuning_dir / "sft_12hz.py"),
             "--init_model_path",
-            args.init_model_path,
+            init_model_path,
             "--output_model_path",
             args.output_model_path,
             "--train_jsonl",

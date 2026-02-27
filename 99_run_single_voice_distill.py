@@ -34,7 +34,7 @@ def main() -> None:
     p.add_argument("--ffn-ratio", type=float, default=0.8)
 
     # Teacher code generation options
-    p.add_argument("--ref-audio", default="dist/ref_audio.WAV")
+    p.add_argument("--ref-audio", default="dist/ref_audio_24k.wav")
     p.add_argument("--ref-text-file", default="dist/ref_text.txt")
     p.add_argument("--x-vector-only", action="store_true")
     p.add_argument("--non-streaming-mode", action="store_true")
