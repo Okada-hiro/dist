@@ -66,8 +66,9 @@ def _bucket(name: str) -> str:
     return "other"
 
 
-def _count_params(model_dir: Path) -> dict[str, int]:
+def _count_params(model_dir: Path) -> tuple[dict[str, int], dict[str, int]]:
     out = defaultdict(int)
+    by_key = defaultdict(int)
     files = list(_iter_safetensors_files(model_dir))
     if not files:
         raise FileNotFoundError(f"No safetensors found under: {model_dir}")
@@ -78,15 +79,22 @@ def _count_params(model_dir: Path) -> dict[str, int]:
                 numel = 1
                 for d in shape:
                     numel *= int(d)
-                out[_bucket(k)] += numel
+                b = _bucket(k)
+                out[b] += numel
+                by_key[k] += numel
                 out["__total__"] += numel
-    return dict(out)
+    return dict(out), dict(by_key)
 
 
 def _ratio(a: int, b: int) -> str:
     if a == 0:
         return "-"
     return f"{(b / a):.3f}x"
+
+
+def _prefix(name: str, depth: int = 3) -> str:
+    parts = name.split(".")
+    return ".".join(parts[: min(depth, len(parts))])
 
 
 def main() -> None:
@@ -98,8 +106,8 @@ def main() -> None:
 
     dir17 = _resolve_model_dir(args.model_17b)
     dir06 = _resolve_model_dir(args.model_06b)
-    c17 = _count_params(dir17)
-    c06 = _count_params(dir06)
+    c17, k17 = _count_params(dir17)
+    c06, k06 = _count_params(dir06)
 
     print("[Resolved]")
     print(f"1.7B dir: {dir17}")
@@ -114,6 +122,37 @@ def main() -> None:
         b = int(c06.get(k, 0))
         print(f"{k} | {a} -> {b} | {_ratio(a, b)}")
 
+    # Expand the "other" bucket into concrete key groups.
+    p17 = defaultdict(int)
+    p06 = defaultdict(int)
+    for name, n in k17.items():
+        if _bucket(name) == "other":
+            p17[_prefix(name, depth=4)] += int(n)
+    for name, n in k06.items():
+        if _bucket(name) == "other":
+            p06[_prefix(name, depth=4)] += int(n)
+
+    if p17 or p06:
+        print("\n[Expanded `other` Bucket (prefix depth=4)]")
+        print("prefix | 1.7B -> 0.6B | ratio(0.6/1.7)")
+        print("-" * 72)
+        for k in sorted(set(p17) | set(p06)):
+            a = int(p17.get(k, 0))
+            b = int(p06.get(k, 0))
+            print(f"{k} | {a} -> {b} | {_ratio(a, b)}")
+
+    # Show top absolute tensors (sanity check for what dominates).
+    def top_items(d: dict[str, int], n: int = 12) -> list[tuple[str, int]]:
+        return sorted(d.items(), key=lambda x: x[1], reverse=True)[:n]
+
+    print("\n[Top Tensor Params: 1.7B]")
+    for name, n in top_items(k17):
+        print(f"{name} | {n}")
+
+    print("\n[Top Tensor Params: 0.6B]")
+    for name, n in top_items(k06):
+        print(f"{name} | {n}")
+
     if args.output_json:
         out = {
             "model_17b": args.model_17b,
@@ -122,6 +161,8 @@ def main() -> None:
             "resolved_06b": str(dir06),
             "counts_17b": c17,
             "counts_06b": c06,
+            "tensor_counts_17b": k17,
+            "tensor_counts_06b": k06,
         }
         op = Path(args.output_json)
         op.parent.mkdir(parents=True, exist_ok=True)
