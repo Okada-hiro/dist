@@ -559,7 +559,9 @@ def _forward_losses(
         full_step = fwd_inputs["codec_ids"][bi : bi + 1, start, :].to(torch.long)  # [1, G]
         sub_target = full_step[:, 1:]  # [1, G-1]
         if sub_target.numel() > 0:
-            sub_seed = torch.zeros_like(full_step)
+            # Keep teacher forcing inside sub-groups (g1..), and replace only g0 with infer-like prediction.
+            # This isolates "c0 mismatch" effect without corrupting sub predictor inputs.
+            sub_seed = full_step.clone()
             sub_seed[:, 0] = pred_c0
             sub_logits_i, _ = model.talker.forward_sub_talker_finetune(sub_seed, hidden_last)
             sub_vocab_i = sub_logits_i.shape[-1]
