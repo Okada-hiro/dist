@@ -396,6 +396,28 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
             sub_best_shift_acc = a
             sub_best_shift = s
 
+    sub_ce_shift0 = float("nan")
+    sub_ce_shift1 = float("nan")
+    with torch.no_grad():
+        if t > 0:
+            v = int(sub_logits.shape[-1])
+            sub_ce_shift0 = float(
+                F.cross_entropy(
+                    sub_logits[:t].reshape(-1, v),
+                    gt_sub.reshape(-1),
+                    reduction="mean",
+                ).detach().cpu().item()
+            )
+        if t > 1:
+            v = int(sub_logits.shape[-1])
+            sub_ce_shift1 = float(
+                F.cross_entropy(
+                    sub_logits[: t - 1].reshape(-1, v),
+                    gt_sub[1:t].reshape(-1),
+                    reduction="mean",
+                ).detach().cpu().item()
+            )
+
     return pred_full.detach().cpu(), {
         "ce0": ce0,
         "ce0_manual_shift0": ce_shift0,
@@ -409,6 +431,8 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
         "sub_acc_shift1": float(sub_acc_shift1),
         "sub_best_shift": int(sub_best_shift),
         "sub_best_shift_acc": float(sub_best_shift_acc),
+        "sub_ce_shift0": sub_ce_shift0,
+        "sub_ce_shift1": sub_ce_shift1,
         "full_acc_teacher_forced": full_acc,
         "teacher_forced_len": int(t),
     }
@@ -668,6 +692,8 @@ def main() -> None:
             "teacher_vs_train_sub_acc_shift1": train_stats["sub_acc_shift1"],
             "teacher_vs_train_sub_best_shift": train_stats["sub_best_shift"],
             "teacher_vs_train_sub_best_shift_acc": train_stats["sub_best_shift_acc"],
+            "teacher_vs_train_sub_ce_shift0": train_stats["sub_ce_shift0"],
+            "teacher_vs_train_sub_ce_shift1": train_stats["sub_ce_shift1"],
             "teacher_vs_infer_full_acc_minlen": gi_acc,
             "train_vs_infer_full_acc_minlen": ti_acc,
             "teacher_vs_train_best_shift": int(best_shift_t2),
@@ -702,6 +728,7 @@ def main() -> None:
             f"acc(Tvs2_sub)={item['teacher_vs_train_sub_acc']:.4f} "
             f"sub(s0/s1)={item['teacher_vs_train_sub_acc_shift0']:.4f}/{item['teacher_vs_train_sub_acc_shift1']:.4f} "
             f"bestShift_sub={item['teacher_vs_train_sub_best_shift']}@{item['teacher_vs_train_sub_best_shift_acc']:.4f} "
+            f"subCE(s0/s1)={item['teacher_vs_train_sub_ce_shift0']:.4f}/{item['teacher_vs_train_sub_ce_shift1']:.4f} "
             f"acc(Tvs3)={item['teacher_vs_infer_full_acc_minlen']:.4f} "
             f"bestShift(Tvs2)={item['teacher_vs_train_best_shift']}@{item['teacher_vs_train_best_shift_acc']:.4f} "
             f"bestShift(Tvs3)={item['teacher_vs_infer_best_shift']}@{item['teacher_vs_infer_best_shift_acc']:.4f} "

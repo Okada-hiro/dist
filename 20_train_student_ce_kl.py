@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 import torch
+import torch.nn.functional as F
 from safetensors.torch import save_file
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
@@ -464,7 +465,15 @@ def _forward_losses(model: Qwen3TTSForConditionalGeneration, fwd_inputs: dict[st
         talker_codec_ids.shape,
         talker_hidden_states.shape,
     )
-    _, sub_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+    sub_logits, _sub_loss_internal = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+    # Use explicit no-shift CE for sub-talker to avoid hidden causal-LM shift mismatch.
+    sub_labels = talker_codec_ids[:, 1:].to(torch.long)  # [N, G-1]
+    sub_vocab = sub_logits.shape[-1]
+    sub_loss = F.cross_entropy(
+        sub_logits.reshape(-1, sub_vocab),
+        sub_labels.reshape(-1),
+        reduction="mean",
+    )
     total = ce0 + 0.3 * sub_loss
     return total, ce0, sub_loss
 
