@@ -497,6 +497,7 @@ def _infer_trainlike_rollout(
         trailing_text_hidden=tts_pad_embed,  # same behavior as non_streaming path in official generate
         tts_pad_embed=tts_pad_embed,
         max_new_tokens=int(max_new_tokens),
+        max_length=int(prefix_embeds.shape[1] + max_new_tokens),
         min_new_tokens=2,
         do_sample=False,
         top_k=1,
@@ -584,6 +585,9 @@ def _infer_trainlike_rollout(
         "infer_path": "talker.generate_from_train_like_prefix",
         "codec_step_tensors_found": int(len(codec_steps)),
         "infer_seq_shape": list(seq.shape),
+        "talker_sequences_shape": list(out.sequences.shape) if hasattr(out, "sequences") else None,
+        "talker_hidden_states_steps": int(len(out.hidden_states)) if getattr(out, "hidden_states", None) is not None else None,
+        "prefix_len": int(prefix_embeds.shape[1]),
     }
     return seq, meta
 
