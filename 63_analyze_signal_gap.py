@@ -24,6 +24,28 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _normalize_text_ids_1d(x: Any) -> torch.Tensor:
+    """
+    Normalize text ids for single-sample analysis.
+    Accepts:
+      - [T]
+      - [1, T]
+      - torch.Tensor of shape [T] or [1, T]
+    Returns:
+      - torch.LongTensor shape [T]
+    """
+    if isinstance(x, torch.Tensor):
+        t = x.detach().cpu().to(torch.long)
+    else:
+        t = torch.tensor(x, dtype=torch.long)
+
+    if t.ndim == 1:
+        return t
+    if t.ndim == 2 and t.shape[0] == 1:
+        return t[0]
+    raise ValueError(f"text_input_ids must be [T] or [1,T], got shape={tuple(t.shape)}")
+
+
 def _write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -164,7 +186,7 @@ def _build_train_like_batch(
     text_ids = row.get("text_input_ids")
     if text_ids is None:
         text_ids = model._tokenize_texts([model._build_assistant_text(str(row["text"]))])[0].detach().cpu().tolist()
-    text_ids = torch.tensor(text_ids, dtype=torch.long)
+    text_ids = _normalize_text_ids_1d(text_ids)
 
     codes = row.get("codec_ids_2d")
     if not codes:
