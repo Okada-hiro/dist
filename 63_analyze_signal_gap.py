@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 import torch
+import torch.nn.functional as F
 
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration, mel_spectrogram
@@ -346,10 +347,31 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
     sub_acc = float((pred_sub[:t] == gt_full[:t, 1:]).float().mean().item()) if t > 0 else 0.0
     full_acc = float((pred_full == gt_full).float().mean().item()) if t > 0 else 0.0
 
+    # Diagnose label/logit alignment explicitly:
+    # manual CE on same index (shift 0) vs one-step shifted comparison.
+    ce_shift0 = float("nan")
+    ce_shift1 = float("nan")
+    with torch.no_grad():
+        if valid.any():
+            ce_shift0 = float(F.cross_entropy(logits0[valid], labels0[valid], reduction="mean").detach().cpu().item())
+        # Compare logits[t] with labels[t+1] to detect off-by-one training target alignment.
+        if logits0.shape[0] > 1 and labels0.shape[0] > 1:
+            logits1 = logits0[:-1]
+            labels1 = labels0[1:]
+            valid1 = labels1 != -100
+            if valid1.any():
+                ce_shift1 = float(F.cross_entropy(logits1[valid1], labels1[valid1], reduction="mean").detach().cpu().item())
+
+    c0_best_shift, c0_best_shift_acc = _best_shift_acc(pred0_audio, gt0_audio, max_shift=3)
+
     return pred_full.detach().cpu(), {
         "ce0": ce0,
+        "ce0_manual_shift0": ce_shift0,
+        "ce0_manual_shift1": ce_shift1,
         "sub_loss": sub_loss_v,
         "codec0_acc_teacher_forced": codec0_acc,
+        "codec0_best_shift": int(c0_best_shift),
+        "codec0_best_shift_acc": float(c0_best_shift_acc),
         "sub_acc_teacher_forced": sub_acc,
         "full_acc_teacher_forced": full_acc,
         "teacher_forced_len": int(t),
@@ -603,6 +625,8 @@ def main() -> None:
             "student_infer_len": int(infer_codes.shape[0]),
             "teacher_vs_train_full_acc": train_stats["full_acc_teacher_forced"],
             "teacher_vs_train_codec0_acc": train_stats["codec0_acc_teacher_forced"],
+            "teacher_vs_train_codec0_best_shift": train_stats["codec0_best_shift"],
+            "teacher_vs_train_codec0_best_shift_acc": train_stats["codec0_best_shift_acc"],
             "teacher_vs_train_sub_acc": train_stats["sub_acc_teacher_forced"],
             "teacher_vs_infer_full_acc_minlen": gi_acc,
             "train_vs_infer_full_acc_minlen": ti_acc,
@@ -611,6 +635,8 @@ def main() -> None:
             "teacher_vs_infer_best_shift": int(best_shift_t3),
             "teacher_vs_infer_best_shift_acc": float(best_acc_t3),
             "ce0": train_stats["ce0"],
+            "ce0_manual_shift0": train_stats["ce0_manual_shift0"],
+            "ce0_manual_shift1": train_stats["ce0_manual_shift1"],
             "sub_loss": train_stats["sub_loss"],
             "teacher_forced_len": train_stats["teacher_forced_len"],
             "teacher_codec_stats": _codec_value_stats(gt_codes_t),
@@ -632,10 +658,12 @@ def main() -> None:
             f"[ROW] {sid} "
             f"acc(Tvs2_full)={item['teacher_vs_train_full_acc']:.4f} "
             f"acc(Tvs2_c0)={item['teacher_vs_train_codec0_acc']:.4f} "
+            f"bestShift_c0={item['teacher_vs_train_codec0_best_shift']}@{item['teacher_vs_train_codec0_best_shift_acc']:.4f} "
             f"acc(Tvs2_sub)={item['teacher_vs_train_sub_acc']:.4f} "
             f"acc(Tvs3)={item['teacher_vs_infer_full_acc_minlen']:.4f} "
             f"bestShift(Tvs2)={item['teacher_vs_train_best_shift']}@{item['teacher_vs_train_best_shift_acc']:.4f} "
             f"bestShift(Tvs3)={item['teacher_vs_infer_best_shift']}@{item['teacher_vs_infer_best_shift_acc']:.4f} "
+            f"ce0(manual s0/s1)={item['ce0_manual_shift0']:.4f}/{item['ce0_manual_shift1']:.4f} "
             f"acc(2vs3)={item['train_vs_infer_full_acc_minlen']:.4f} "
             f"len(T/2/3)={item['teacher_len']}/{item['student_train_len']}/{item['student_infer_len']}"
         )
