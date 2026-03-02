@@ -400,6 +400,62 @@ def _decode_codes_to_wav(model: Qwen3TTSModel, codes_2d: torch.Tensor, out_path:
     sf.write(str(out_path), wavs[0], sr)
 
 
+def _codec_value_stats(codes_2d: torch.Tensor) -> dict[str, Any]:
+    t = codes_2d.detach().cpu().to(torch.long)
+    return {
+        "shape": list(t.shape),
+        "min": int(t.min().item()) if t.numel() else 0,
+        "max": int(t.max().item()) if t.numel() else 0,
+    }
+
+
+def _find_invalid_codec_entries(model: Qwen3TTSModel, codes_2d: torch.Tensor, max_report: int = 16) -> tuple[list[dict[str, int]], int]:
+    """
+    Return invalid codec entries where value is outside [0, codebook_size-1].
+    """
+    t = codes_2d.detach().cpu().to(torch.long)
+    code_vocab = int(model.model.speech_tokenizer.model.config.decoder_config.codebook_size)
+    bad = (t < 0) | (t >= code_vocab)
+    idx = torch.nonzero(bad, as_tuple=False)
+    total_bad = int(idx.shape[0])
+    out = []
+    for r in idx[:max_report]:
+        rr = int(r[0].item())
+        cc = int(r[1].item())
+        out.append({"time_index": rr, "group_index": cc, "value": int(t[rr, cc].item())})
+    return out, total_bad
+
+
+def _is_decode_safe(model: Qwen3TTSModel, codes_2d: torch.Tensor) -> tuple[bool, str, list[dict[str, int]], int]:
+    """
+    Conservative range check before passing codec ids to speech tokenizer decoder.
+    """
+    t = codes_2d.detach().cpu().to(torch.long)
+    if t.ndim != 2:
+        return False, f"codes rank must be 2, got {tuple(t.shape)}", [], 0
+    if t.shape[1] != int(model.model.config.talker_config.num_code_groups):
+        return False, f"num_code_groups mismatch: got {t.shape[1]} expected {int(model.model.config.talker_config.num_code_groups)}", [], 0
+    if t.numel() == 0:
+        return False, "empty codes", [], 0
+
+    # Speech tokenizer decoder ultimately indexes codebooks with this bound.
+    code_vocab = int(model.model.speech_tokenizer.model.config.decoder_config.codebook_size)
+    mn = int(t.min().item())
+    mx = int(t.max().item())
+    if mn < 0 or mx >= code_vocab:
+        examples, total_bad = _find_invalid_codec_entries(model, t, max_report=16)
+        return False, f"out-of-range codes: min={mn} max={mx} valid=[0,{code_vocab-1}]", examples, total_bad
+    return True, "ok", [], 0
+
+
+def _clamp_codes_for_decode(model: Qwen3TTSModel, codes_2d: torch.Tensor) -> torch.Tensor:
+    """
+    Best-effort rescue decode for diagnostics only.
+    """
+    code_vocab = int(model.model.speech_tokenizer.model.config.decoder_config.codebook_size)
+    return codes_2d.detach().cpu().to(torch.long).clamp(min=0, max=code_vocab - 1)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Diagnose 1/2/3 signal gap: teacher vs student-train-vs student-infer.")
     p.add_argument("--student-model", required=True)
@@ -414,6 +470,7 @@ def main() -> None:
     p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--fixed-spk-id", type=int, default=0)
     p.add_argument("--device", default=None)
+    p.add_argument("--force-clamped-decode", action="store_true", help="If set, also decode clamped student codes when out-of-range.")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -465,9 +522,43 @@ def main() -> None:
         n_gt_inf = min(int(gt_codes_t.shape[0]), int(infer_codes.shape[0]))
         gi_acc = float((gt_codes_t[:n_gt_inf] == infer_codes[:n_gt_inf]).float().mean().item()) if n_gt_inf > 0 else 0.0
 
-        _decode_codes_to_wav(model, gt_codes_t, out_dir / f"{sid}.teacher_signal.wav")
-        _decode_codes_to_wav(model, train_pred_codes, out_dir / f"{sid}.student_train_signal.wav")
-        _decode_codes_to_wav(model, infer_codes, out_dir / f"{sid}.student_infer_signal.wav")
+        teacher_wav = out_dir / f"{sid}.teacher_signal.wav"
+        student_train_wav = out_dir / f"{sid}.student_train_signal.wav"
+        student_infer_wav = out_dir / f"{sid}.student_infer_signal.wav"
+
+        decode_notes: list[str] = []
+        ok_t, msg_t, ex_t, nbad_t = _is_decode_safe(model, gt_codes_t)
+        ok_2, msg_2, ex_2, nbad_2 = _is_decode_safe(model, train_pred_codes)
+        ok_3, msg_3, ex_3, nbad_3 = _is_decode_safe(model, infer_codes)
+
+        if ok_t:
+            _decode_codes_to_wav(model, gt_codes_t, teacher_wav)
+        else:
+            decode_notes.append(f"teacher_decode_skipped: {msg_t}")
+        if ok_2:
+            _decode_codes_to_wav(model, train_pred_codes, student_train_wav)
+        else:
+            decode_notes.append(f"student_train_decode_skipped: {msg_2}")
+            decode_notes.append(f"student_train_invalid_total: {nbad_2}")
+            if ex_2:
+                decode_notes.append(f"student_train_invalid_examples: {json.dumps(ex_2, ensure_ascii=False)}")
+            if args.force_clamped_decode:
+                clamped = _clamp_codes_for_decode(model, train_pred_codes)
+                clamped_wav = out_dir / f"{sid}.student_train_signal.clamped.wav"
+                _decode_codes_to_wav(model, clamped, clamped_wav)
+                decode_notes.append(f"student_train_clamped_wav: {str(clamped_wav)}")
+        if ok_3:
+            _decode_codes_to_wav(model, infer_codes, student_infer_wav)
+        else:
+            decode_notes.append(f"student_infer_decode_skipped: {msg_3}")
+            decode_notes.append(f"student_infer_invalid_total: {nbad_3}")
+            if ex_3:
+                decode_notes.append(f"student_infer_invalid_examples: {json.dumps(ex_3, ensure_ascii=False)}")
+            if args.force_clamped_decode:
+                clamped = _clamp_codes_for_decode(model, infer_codes)
+                clamped_wav = out_dir / f"{sid}.student_infer_signal.clamped.wav"
+                _decode_codes_to_wav(model, clamped, clamped_wav)
+                decode_notes.append(f"student_infer_clamped_wav: {str(clamped_wav)}")
 
         item = {
             "id": sid,
@@ -483,9 +574,19 @@ def main() -> None:
             "ce0": train_stats["ce0"],
             "sub_loss": train_stats["sub_loss"],
             "teacher_forced_len": train_stats["teacher_forced_len"],
-            "teacher_wav": str(out_dir / f"{sid}.teacher_signal.wav"),
-            "student_train_wav": str(out_dir / f"{sid}.student_train_signal.wav"),
-            "student_infer_wav": str(out_dir / f"{sid}.student_infer_signal.wav"),
+            "teacher_codec_stats": _codec_value_stats(gt_codes_t),
+            "student_train_codec_stats": _codec_value_stats(train_pred_codes),
+            "student_infer_codec_stats": _codec_value_stats(infer_codes),
+            "teacher_invalid_count": nbad_t,
+            "student_train_invalid_count": nbad_2,
+            "student_infer_invalid_count": nbad_3,
+            "teacher_invalid_examples": ex_t,
+            "student_train_invalid_examples": ex_2,
+            "student_infer_invalid_examples": ex_3,
+            "teacher_wav": str(teacher_wav) if ok_t else None,
+            "student_train_wav": str(student_train_wav) if ok_2 else None,
+            "student_infer_wav": str(student_infer_wav) if ok_3 else None,
+            "decode_notes": decode_notes,
         }
         report.append(item)
         print(
@@ -495,6 +596,8 @@ def main() -> None:
             f"acc(2vs3)={item['train_vs_infer_full_acc_minlen']:.4f} "
             f"len(T/2/3)={item['teacher_len']}/{item['student_train_len']}/{item['student_infer_len']}"
         )
+        for n in decode_notes:
+            print(f"[NOTE] {sid}: {n}")
 
     _write_json(out_dir / "signal_gap_report.json", report)
     print(f"[DONE] wrote report -> {out_dir / 'signal_gap_report.json'}")
