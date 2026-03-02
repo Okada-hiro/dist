@@ -402,6 +402,36 @@ def _decode_codes_to_wav(model: Qwen3TTSModel, codes_2d: torch.Tensor, out_path:
     sf.write(str(out_path), wavs[0], sr)
 
 
+def _best_shift_acc(pred: torch.Tensor, gt: torch.Tensor, max_shift: int = 3) -> tuple[int, float]:
+    """
+    Compare pred vs gt with integer time shift.
+      shift > 0 : pred is delayed (compare pred[shift:] with gt[:-shift])
+      shift < 0 : pred is advanced (compare pred[:shift] with gt[-shift:])
+    """
+    pred = pred.detach().cpu()
+    gt = gt.detach().cpu()
+    best_s = 0
+    best_a = 0.0
+    for s in range(-max_shift, max_shift + 1):
+        if s > 0:
+            p = pred[s:]
+            g = gt[:-s]
+        elif s < 0:
+            p = pred[:s]
+            g = gt[-s:]
+        else:
+            p = pred
+            g = gt
+        n = min(int(p.shape[0]), int(g.shape[0]))
+        if n <= 0:
+            continue
+        a = float((p[:n] == g[:n]).float().mean().item())
+        if a > best_a:
+            best_a = a
+            best_s = s
+    return best_s, best_a
+
+
 def _codec_value_stats(codes_2d: torch.Tensor) -> dict[str, Any]:
     t = codes_2d.detach().cpu().to(torch.long)
     return {
@@ -523,6 +553,8 @@ def main() -> None:
         ti_acc = float((train_pred_codes[:n_ti] == infer_codes[:n_ti]).float().mean().item()) if n_ti > 0 else 0.0
         n_gt_inf = min(int(gt_codes_t.shape[0]), int(infer_codes.shape[0]))
         gi_acc = float((gt_codes_t[:n_gt_inf] == infer_codes[:n_gt_inf]).float().mean().item()) if n_gt_inf > 0 else 0.0
+        best_shift_t2, best_acc_t2 = _best_shift_acc(train_pred_codes, gt_codes_t, max_shift=3)
+        best_shift_t3, best_acc_t3 = _best_shift_acc(infer_codes, gt_codes_t, max_shift=3)
 
         teacher_wav = out_dir / f"{sid}.teacher_signal.wav"
         student_train_wav = out_dir / f"{sid}.student_train_signal.wav"
@@ -574,6 +606,10 @@ def main() -> None:
             "teacher_vs_train_sub_acc": train_stats["sub_acc_teacher_forced"],
             "teacher_vs_infer_full_acc_minlen": gi_acc,
             "train_vs_infer_full_acc_minlen": ti_acc,
+            "teacher_vs_train_best_shift": int(best_shift_t2),
+            "teacher_vs_train_best_shift_acc": float(best_acc_t2),
+            "teacher_vs_infer_best_shift": int(best_shift_t3),
+            "teacher_vs_infer_best_shift_acc": float(best_acc_t3),
             "ce0": train_stats["ce0"],
             "sub_loss": train_stats["sub_loss"],
             "teacher_forced_len": train_stats["teacher_forced_len"],
@@ -598,6 +634,8 @@ def main() -> None:
             f"acc(Tvs2_c0)={item['teacher_vs_train_codec0_acc']:.4f} "
             f"acc(Tvs2_sub)={item['teacher_vs_train_sub_acc']:.4f} "
             f"acc(Tvs3)={item['teacher_vs_infer_full_acc_minlen']:.4f} "
+            f"bestShift(Tvs2)={item['teacher_vs_train_best_shift']}@{item['teacher_vs_train_best_shift_acc']:.4f} "
+            f"bestShift(Tvs3)={item['teacher_vs_infer_best_shift']}@{item['teacher_vs_infer_best_shift_acc']:.4f} "
             f"acc(2vs3)={item['train_vs_infer_full_acc_minlen']:.4f} "
             f"len(T/2/3)={item['teacher_len']}/{item['student_train_len']}/{item['student_infer_len']}"
         )
