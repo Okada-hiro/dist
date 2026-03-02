@@ -246,6 +246,7 @@ class QwenLikeCollator:
         attention_mask = torch.zeros((b, max_len), dtype=torch.long)
         codec_0_labels = torch.full((b, max_len), -100, dtype=torch.long)
         speaker_pos = torch.zeros((b,), dtype=torch.long)
+        audio_start_pos = torch.full((b,), -1, dtype=torch.long)
 
         for i in range(b):
             text_ids = text_ids_list[i]
@@ -267,6 +268,7 @@ class QwenLikeCollator:
             audio_start = codec_bos_pos + 1
             audio_end = audio_start + codec_len
             codec_eos_pos = audio_end
+            audio_start_pos[i] = int(audio_start)
 
             # text channel
             input_ids[i, :role_len, 0] = text_ids[:role_len]
@@ -324,6 +326,7 @@ class QwenLikeCollator:
             "codec_0_labels": codec_0_labels,
             "codec_mask": codec_mask,
             "speaker_pos": speaker_pos,
+            "audio_start_pos": audio_start_pos,
         }
 
 
@@ -419,6 +422,7 @@ def _build_forward_inputs(
     codec_0_labels = batch["codec_0_labels"]
     codec_mask = batch["codec_mask"]
     speaker_pos = batch["speaker_pos"]
+    audio_start_pos = batch["audio_start_pos"]
 
     input_text_ids = input_ids[:, :, 0]
     input_codec_ids = input_ids[:, :, 1]
@@ -440,10 +444,16 @@ def _build_forward_inputs(
         "codec_0_labels": codec_0_labels,
         "codec_ids": codec_ids,
         "codec_mask": codec_mask,
+        "audio_start_pos": audio_start_pos,
     }
 
 
-def _forward_losses(model: Qwen3TTSForConditionalGeneration, fwd_inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _forward_losses(
+    model: Qwen3TTSForConditionalGeneration,
+    fwd_inputs: dict[str, torch.Tensor],
+    *,
+    step0_weight: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Important:
     # Qwen/Transformers causal LM loss path already applies internal next-token shift.
     # Pass full-length inputs/labels here to avoid accidental double-shift.
@@ -474,8 +484,25 @@ def _forward_losses(model: Qwen3TTSForConditionalGeneration, fwd_inputs: dict[st
         sub_labels.reshape(-1),
         reduction="mean",
     )
-    total = ce0 + 0.3 * sub_loss
-    return total, ce0, sub_loss
+
+    # Step-0 bootstrap loss: strongly supervise the first audio codec_0 token per sample.
+    logits0 = outputs.logits  # [B, L, vocab]
+    audio_start_pos = fwd_inputs["audio_start_pos"].to(logits0.device)
+    bsz, seqlen = logits0.shape[0], logits0.shape[1]
+    bidx = torch.arange(bsz, device=logits0.device, dtype=torch.long)
+    valid = (audio_start_pos >= 0) & (audio_start_pos < seqlen)
+    if valid.any():
+        pos = audio_start_pos[valid].to(torch.long)
+        target_step0 = fwd_inputs["codec_ids"][valid, pos, 0].to(torch.long)
+        pred_step0 = logits0[valid, pos, :]
+        step0_ce = F.cross_entropy(pred_step0, target_step0, reduction="mean")
+        step0_acc = (pred_step0.argmax(dim=-1) == target_step0).float().mean()
+    else:
+        step0_ce = ce0.new_zeros(())
+        step0_acc = ce0.new_zeros(())
+
+    total = ce0 + 0.3 * sub_loss + float(step0_weight) * step0_ce
+    return total, ce0, sub_loss, step0_ce, step0_acc
 
 
 def main() -> None:
@@ -499,6 +526,17 @@ def main() -> None:
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--dry-run-only", action="store_true")
     p.add_argument("--save-strategy", choices=["no", "epoch"], default="no")
+    p.add_argument(
+        "--step0-weight",
+        type=float,
+        default=0.0,
+        help="Additional loss weight for the first audio codec_0 token (step-0 bootstrap).",
+    )
+    p.add_argument(
+        "--log-step0-acc",
+        action="store_true",
+        help="If set, print step-0 token accuracy in dry-run and training logs.",
+    )
     p.add_argument("--fixed-spk-id", type=int, default=0)
     p.add_argument(
         "--adamw-foreach",
@@ -599,13 +637,16 @@ def main() -> None:
     sample = next(iter(loader))
     sample = {k: v.to(device) for k, v in sample.items()}
     fwd_inputs = _build_forward_inputs(model, sample, fixed_speaker_embedding)
-    loss, ce0, sub = _forward_losses(model, fwd_inputs)
+    loss, ce0, sub, step0, step0_acc = _forward_losses(model, fwd_inputs, step0_weight=args.step0_weight)
     loss.backward()
     optimizer.zero_grad(set_to_none=True)
-    print(
+    dry = (
         f"[OK] dry-run passed: total={float(loss.detach().cpu()):.4f} "
-        f"(ce0={float(ce0.detach().cpu()):.4f}, sub={float(sub.detach().cpu()):.4f})"
+        f"(ce0={float(ce0.detach().cpu()):.4f}, sub={float(sub.detach().cpu()):.4f}, step0={float(step0.detach().cpu()):.4f})"
     )
+    if args.log_step0_acc:
+        dry += f" step0_acc={float(step0_acc.detach().cpu()):.4f}"
+    print(dry)
     if args.dry_run_only:
         print("[DONE] dry-run-only mode.")
         return
@@ -626,7 +667,7 @@ def main() -> None:
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) for k, v in batch.items()}
             fwd_inputs = _build_forward_inputs(model, batch, fixed_speaker_embedding)
-            loss, ce0, sub = _forward_losses(model, fwd_inputs)
+            loss, ce0, sub, step0, step0_acc = _forward_losses(model, fwd_inputs, step0_weight=args.step0_weight)
             (loss / args.grad_accum).backward()
 
             if (step + 1) % args.grad_accum == 0:
@@ -636,12 +677,16 @@ def main() -> None:
                 global_step += 1
 
             running += float(loss.detach().cpu())
-            pbar.set_postfix(
-                loss=f"{running / (step + 1):.4f}",
-                ce0=f"{float(ce0.detach().cpu()):.4f}",
-                sub=f"{float(sub.detach().cpu()):.4f}",
-                step=global_step,
-            )
+            postfix = {
+                "loss": f"{running / (step + 1):.4f}",
+                "ce0": f"{float(ce0.detach().cpu()):.4f}",
+                "sub": f"{float(sub.detach().cpu()):.4f}",
+                "step0": f"{float(step0.detach().cpu()):.4f}",
+                "step": global_step,
+            }
+            if args.log_step0_acc:
+                postfix["s0_acc"] = f"{float(step0_acc.detach().cpu()):.4f}"
+            pbar.set_postfix(**postfix)
 
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
