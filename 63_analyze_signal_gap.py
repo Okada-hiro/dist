@@ -479,7 +479,7 @@ def _infer_trainlike_rollout(
     fixed_speaker_embedding: torch.Tensor,
     max_new_tokens: int,
     ignore_eos: bool = False,
-) -> tuple[torch.Tensor, dict[str, Any]]:
+) -> tuple[torch.Tensor, dict[str, Any], dict[str, Any]]:
     m = model.model
     input_embeddings, attention_mask = _build_trainlike_input_embeddings(model, batch, fixed_speaker_embedding)
 
@@ -602,7 +602,13 @@ def _infer_trainlike_rollout(
         "raw_c0_eos_count_before_trunc": int(raw_c0_eos_count),
         "raw_c0_first_eos_pos_before_trunc": raw_c0_first_eos_pos,
     }
-    return seq, meta
+    debug = {
+        "prefix_embeds_shape": list(prefix_embeds.shape),
+        "prefix_attention_shape": list(prefix_attention.shape),
+        "tts_pad_embed_shape": list(tts_pad_embed.shape),
+        "infer_codes_first_steps": seq[:2].detach().cpu().to(torch.long),
+    }
+    return seq, meta, debug
 
 
 def _infer_generate_codes(
@@ -616,7 +622,7 @@ def _infer_generate_codes(
     max_new_tokens: int,
     use_voice_clone: bool,
     input_ids_override: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, dict[str, Any]]:
+) -> tuple[torch.Tensor, dict[str, Any], dict[str, Any]]:
     if input_ids_override is not None:
         iid = input_ids_override.detach().clone().to(model.model.device).to(torch.long)
         if iid.ndim == 1:
@@ -641,7 +647,7 @@ def _infer_generate_codes(
             for it in items
         ]
 
-    codes_list, _ = model.model.generate(
+    codes_list, hidden_list = model.model.generate(
         input_ids=input_ids,
         ref_ids=ref_ids,
         voice_clone_prompt=voice_clone_prompt_dict,
@@ -673,7 +679,16 @@ def _infer_generate_codes(
         "ref_ids_len": int(ref_ids[0].shape[-1]) if ref_ids and ref_ids[0] is not None else None,
         "has_voice_clone_prompt": voice_clone_prompt_dict is not None,
     }
-    return c, meta
+    debug = {
+        "input_ids_shape": [list(t.shape) for t in input_ids],
+        "ref_ids_shape": [list(t.shape) if t is not None else None for t in (ref_ids or [])],
+        "voice_clone_prompt_keys": sorted(list(voice_clone_prompt_dict.keys())) if isinstance(voice_clone_prompt_dict, dict) else None,
+        "voice_clone_prompt_ref_code_shape": [list(t.shape) if t is not None else None for t in (voice_clone_prompt_dict.get("ref_code", []) if isinstance(voice_clone_prompt_dict, dict) else [])],
+        "voice_clone_prompt_ref_spk_shape": [list(t.shape) if t is not None else None for t in (voice_clone_prompt_dict.get("ref_spk_embedding", []) if isinstance(voice_clone_prompt_dict, dict) else [])],
+        "infer_codes_first_steps": c[:2].detach().cpu().to(torch.long),
+        "infer_hidden_first_steps": hidden_list[0][:2].detach().cpu().to(torch.float32) if hidden_list and hidden_list[0] is not None else None,
+    }
+    return c, meta, debug
 
 
 @torch.no_grad()
@@ -767,6 +782,64 @@ def _best_shift_acc(pred: torch.Tensor, gt: torch.Tensor, max_shift: int = 3) ->
             best_a = a
             best_s = s
     return best_s, best_a
+
+
+def _topk_logits(logits: torch.Tensor, k: int = 8) -> dict[str, Any]:
+    kk = min(int(k), int(logits.shape[-1]))
+    vals, idx = torch.topk(logits.detach().cpu().to(torch.float32), k=kk, dim=-1)
+    return {"indices": idx.tolist(), "values": vals.tolist()}
+
+
+@torch.inference_mode()
+def _collect_train_step_vectors(
+    model: Qwen3TTSModel,
+    batch: dict[str, torch.Tensor],
+    fixed_speaker_embedding: torch.Tensor,
+    gt_codes: torch.Tensor,
+    dump_steps: int = 2,
+) -> dict[str, Any]:
+    m = model.model
+    input_embeddings, attention_mask = _build_trainlike_input_embeddings(model, batch, fixed_speaker_embedding)
+    audio_start = int(batch["audio_start"])
+    audio_end = int(batch["audio_end"])
+    steps = max(1, int(dump_steps))
+
+    outputs = m.talker(
+        inputs_embeds=input_embeddings.to(m.device),
+        attention_mask=attention_mask.to(m.device),
+        output_hidden_states=True,
+    )
+    logits = outputs.logits[0].detach().cpu()
+    h_last = outputs.hidden_states[0][-1][0].detach().cpu()
+
+    infer_like = []
+    for s in range(min(steps, max(0, audio_end - audio_start))):
+        pref_end = audio_start + s
+        pref = input_embeddings[:, :pref_end, :].to(m.device)
+        attn = attention_mask[:, :pref_end].to(m.device)
+        o = m.talker(inputs_embeds=pref, attention_mask=attn, output_hidden_states=False)
+        next_logit = o.logits[0, -1].detach().cpu()
+        tgt = int(gt_codes[s, 0].item()) if s < int(gt_codes.shape[0]) else None
+        pred = int(next_logit.argmax().item())
+        infer_like.append(
+            {
+                "step": int(s),
+                "target_codec0": tgt,
+                "pred_codec0": pred,
+                "topk": _topk_logits(next_logit.unsqueeze(0), k=8),
+            }
+        )
+
+    pos0 = audio_start
+    pos1 = min(audio_start + steps, logits.shape[0])
+    return {
+        "audio_start": int(audio_start),
+        "audio_end": int(audio_end),
+        "gt_step_codes": gt_codes[:steps].detach().cpu().to(torch.long).tolist(),
+        "teacher_forced_codec0_topk": _topk_logits(logits[pos0:pos1, :], k=8),
+        "teacher_forced_hidden_step": h_last[pos0:pos1, :].to(torch.float32),
+        "infer_like_step": infer_like,
+    }
 
 
 def _codec_value_stats(codes_2d: torch.Tensor) -> dict[str, Any]:
@@ -866,6 +939,12 @@ def main() -> None:
         action="store_true",
         help="Before inference, temporarily overwrite codec_embedding[fixed_spk_id] with the same fixed speaker vector used in train-like path.",
     )
+    p.add_argument(
+        "--dump-step-vectors",
+        action="store_true",
+        help="Save step0/1 diagnostic tensors (.pt) for train-like and infer paths.",
+    )
+    p.add_argument("--dump-steps", type=int, default=2, help="Number of initial audio steps to dump.")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -900,8 +979,18 @@ def main() -> None:
 
         batch = _build_train_like_batch(model, row, fixed_spk_id=args.fixed_spk_id, max_codec_len=None)
         train_pred_codes, train_stats = _teacher_forced_predict(model, batch, fixed_speaker_embedding)
+        train_vec = None
+        if args.dump_step_vectors:
+            train_vec = _collect_train_step_vectors(
+                model=model,
+                batch=batch,
+                fixed_speaker_embedding=fixed_speaker_embedding,
+                gt_codes=gt_codes_t,
+                dump_steps=args.dump_steps,
+            )
 
         backup_row = None
+        infer_dbg: dict[str, Any] = {}
         try:
             if args.infer_inject_fixed_speaker_row:
                 backup_row = _inject_fixed_speaker_row(model, args.fixed_spk_id, fixed_speaker_embedding)
@@ -910,7 +999,7 @@ def main() -> None:
                 infer_input_ids_override = _normalize_text_ids_1d(row.get("text_input_ids"))
             infer_max_new_tokens = int(gt_codes_t.shape[0]) if args.infer_max_new_tokens_like_teacher else int(args.max_new_tokens)
             if args.infer_trainlike_rollout:
-                infer_codes, infer_meta = _infer_trainlike_rollout(
+                infer_codes, infer_meta, infer_dbg = _infer_trainlike_rollout(
                     model=model,
                     batch=batch,
                     fixed_speaker_embedding=fixed_speaker_embedding,
@@ -918,7 +1007,7 @@ def main() -> None:
                     ignore_eos=args.infer_trainlike_ignore_eos,
                 )
             else:
-                infer_codes, infer_meta = _infer_generate_codes(
+                infer_codes, infer_meta, infer_dbg = _infer_generate_codes(
                     model=model,
                     text=text,
                     language=language,
@@ -1053,6 +1142,19 @@ def main() -> None:
             "student_infer_wav": str(student_infer_wav) if ok_3 else None,
             "decode_notes": decode_notes,
         }
+        if args.dump_step_vectors:
+            vec_path = out_dir / f"{sid}.step_vectors.pt"
+            torch.save(
+                {
+                    "id": sid,
+                    "text": text,
+                    "language": language,
+                    "train_vectors": train_vec,
+                    "infer_vectors": infer_dbg,
+                },
+                str(vec_path),
+            )
+            item["step_vector_dump"] = str(vec_path)
         report.append(item)
         print(
             f"[ROW] {sid} "
