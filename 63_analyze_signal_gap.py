@@ -438,6 +438,107 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
     }
 
 
+def _build_trainlike_input_embeddings(
+    model: Qwen3TTSModel,
+    batch: dict[str, torch.Tensor],
+    fixed_speaker_embedding: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = model.model
+    device = m.device
+    b = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+
+    input_ids = b["input_ids"]
+    codec_ids = b["codec_ids"]
+    text_embedding_mask = b["text_embedding_mask"]
+    codec_embedding_mask = b["codec_embedding_mask"]
+    codec_mask = b["codec_mask"]
+    speaker_pos = b["speaker_pos"]
+    attention_mask = b["attention_mask"]
+
+    input_text_ids = input_ids[:, :, 0]
+    input_codec_ids = input_ids[:, :, 1]
+    input_text_embedding = m.talker.model.text_embedding(input_text_ids) * text_embedding_mask
+    input_codec_embedding = m.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+    spk = fixed_speaker_embedding.to(input_codec_embedding.device).to(input_codec_embedding.dtype).view(1, -1)
+    row = torch.arange(input_codec_embedding.shape[0], device=input_codec_embedding.device)
+    input_codec_embedding[row, speaker_pos, :] = spk.expand(input_codec_embedding.shape[0], -1)
+    input_embeddings = input_text_embedding + input_codec_embedding
+
+    for i in range(1, int(m.talker.config.num_code_groups)):
+        codec_i_embedding = m.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+        codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+        input_embeddings = input_embeddings + codec_i_embedding
+
+    return input_embeddings, attention_mask
+
+
+@torch.inference_mode()
+def _infer_trainlike_rollout(
+    model: Qwen3TTSModel,
+    batch: dict[str, torch.Tensor],
+    fixed_speaker_embedding: torch.Tensor,
+    max_new_tokens: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    m = model.model
+    input_embeddings, attention_mask = _build_trainlike_input_embeddings(model, batch, fixed_speaker_embedding)
+
+    # Prefix ends at codec BOS position; generation starts from first audio token.
+    audio_start = int(batch["audio_start"])
+    prefix_embeds = input_embeddings[:, :audio_start, :]
+    prefix_attention = attention_mask.to(prefix_embeds.device)[:, :audio_start]
+
+    pad_id = int(m.config.tts_pad_token_id)
+    pad_tok = torch.tensor([[pad_id]], device=prefix_embeds.device, dtype=torch.long)
+    tts_pad_embed = m.talker.text_projection(m.talker.get_text_embeddings()(pad_tok))
+
+    out = m.talker.generate(
+        inputs_embeds=prefix_embeds,
+        attention_mask=prefix_attention,
+        trailing_text_hidden=tts_pad_embed,  # same behavior as non_streaming path in official generate
+        tts_pad_embed=tts_pad_embed,
+        max_new_tokens=int(max_new_tokens),
+        min_new_tokens=2,
+        do_sample=False,
+        top_k=1,
+        top_p=1.0,
+        temperature=1.0,
+        subtalker_dosample=False,
+        subtalker_top_k=1,
+        subtalker_top_p=1.0,
+        subtalker_temperature=1.0,
+        eos_token_id=int(m.config.talker_config.codec_eos_token_id),
+        repetition_penalty=1.0,
+        suppress_tokens=[],
+        output_hidden_states=True,
+        return_dict_in_generate=True,
+    )
+    seq = out.sequences[0].detach().cpu().to(torch.long)
+    if seq.ndim == 1:
+        seq = seq.unsqueeze(-1)
+
+    # Match outer generate() behavior: truncate before first codec EOS at codebook-0.
+    eos_id = int(m.config.talker_config.codec_eos_token_id)
+    if seq.numel() > 0:
+        c0 = seq[:, 0]
+        eos_pos = torch.nonzero(c0 == eos_id, as_tuple=False).flatten()
+        if eos_pos.numel() > 0:
+            seq = seq[: int(eos_pos[0].item()), :]
+
+    meta = {
+        "use_voice_clone": False,
+        "x_vector_only": False,
+        "non_streaming_mode": True,
+        "language": "trainlike",
+        "max_new_tokens": int(max_new_tokens),
+        "input_text_len": int(prefix_embeds.shape[1]),
+        "ref_ids_len": None,
+        "has_voice_clone_prompt": False,
+        "input_ids_source": "train_like_prefix",
+        "infer_path": "talker.generate_from_train_like_prefix",
+    }
+    return seq, meta
+
+
 def _infer_generate_codes(
     model: Qwen3TTSModel,
     text: str,
@@ -675,6 +776,11 @@ def main() -> None:
     p.add_argument("--force-clamped-decode", action="store_true", help="If set, also decode clamped student codes when out-of-range.")
     p.add_argument("--infer-no-voice-clone", action="store_true", help="Disable voice-clone prompt in inference path even if ref-audio is given.")
     p.add_argument(
+        "--infer-trainlike-rollout",
+        action="store_true",
+        help="Bypass high-level model.generate and run talker.generate from train-like prefix/mask/speaker path.",
+    )
+    p.add_argument(
         "--infer-use-train-text-ids",
         action="store_true",
         help="Use row.text_input_ids directly for inference input_ids instead of re-tokenizing row.text.",
@@ -732,20 +838,29 @@ def main() -> None:
             if args.infer_use_train_text_ids and row.get("text_input_ids") is not None:
                 infer_input_ids_override = _normalize_text_ids_1d(row.get("text_input_ids"))
             infer_max_new_tokens = int(gt_codes_t.shape[0]) if args.infer_max_new_tokens_like_teacher else int(args.max_new_tokens)
-            infer_codes, infer_meta = _infer_generate_codes(
-                model=model,
-                text=text,
-                language=language,
-                ref_audio=args.ref_audio,
-                ref_text=ref_text,
-                x_vector_only=args.x_vector_only,
-                non_streaming_mode=args.non_streaming_mode,
-                max_new_tokens=infer_max_new_tokens,
-                use_voice_clone=not args.infer_no_voice_clone,
-                input_ids_override=infer_input_ids_override,
-            )
+            if args.infer_trainlike_rollout:
+                infer_codes, infer_meta = _infer_trainlike_rollout(
+                    model=model,
+                    batch=batch,
+                    fixed_speaker_embedding=fixed_speaker_embedding,
+                    max_new_tokens=infer_max_new_tokens,
+                )
+            else:
+                infer_codes, infer_meta = _infer_generate_codes(
+                    model=model,
+                    text=text,
+                    language=language,
+                    ref_audio=args.ref_audio,
+                    ref_text=ref_text,
+                    x_vector_only=args.x_vector_only,
+                    non_streaming_mode=args.non_streaming_mode,
+                    max_new_tokens=infer_max_new_tokens,
+                    use_voice_clone=not args.infer_no_voice_clone,
+                    input_ids_override=infer_input_ids_override,
+                )
             infer_meta["inject_fixed_speaker_row"] = bool(args.infer_inject_fixed_speaker_row)
             infer_meta["max_new_tokens_like_teacher"] = bool(args.infer_max_new_tokens_like_teacher)
+            infer_meta["trainlike_rollout"] = bool(args.infer_trainlike_rollout)
         finally:
             if backup_row is not None:
                 _restore_speaker_row(model, args.fixed_spk_id, backup_row)
