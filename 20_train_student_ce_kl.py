@@ -453,7 +453,8 @@ def _forward_losses(
     fwd_inputs: dict[str, torch.Tensor],
     *,
     step0_weight: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    infer_like_step0_weight: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Important:
     # Qwen/Transformers causal LM loss path already applies internal next-token shift.
     # Pass full-length inputs/labels here to avoid accidental double-shift.
@@ -501,8 +502,38 @@ def _forward_losses(
         step0_ce = ce0.new_zeros(())
         step0_acc = ce0.new_zeros(())
 
-    total = ce0 + 0.3 * sub_loss + float(step0_weight) * step0_ce
-    return total, ce0, sub_loss, step0_ce, step0_acc
+    # Infer-like step0 stats/loss:
+    # Use only prefix up to (audio_start - 1), then predict the first audio token.
+    infer_like_losses: list[torch.Tensor] = []
+    infer_like_accs: list[torch.Tensor] = []
+    bsz = int(audio_start_pos.shape[0])
+    for bi in range(bsz):
+        start = int(audio_start_pos[bi].item())
+        if start <= 0:
+            continue
+        pref_emb = fwd_inputs["input_embeddings"][bi : bi + 1, :start, :]
+        pref_attn = fwd_inputs["attention_mask"][bi : bi + 1, :start]
+        o_pref = model.talker(
+            inputs_embeds=pref_emb,
+            attention_mask=pref_attn,
+            output_hidden_states=False,
+        )
+        logit_next = o_pref.logits[:, -1, :]  # predicts token at position == start
+        target_next = fwd_inputs["codec_ids"][bi : bi + 1, start, 0].to(torch.long)
+        ce_pref = F.cross_entropy(logit_next, target_next, reduction="mean")
+        acc_pref = (logit_next.argmax(dim=-1) == target_next).float().mean()
+        infer_like_losses.append(ce_pref)
+        infer_like_accs.append(acc_pref)
+
+    if infer_like_losses:
+        infer_like_step0_ce = torch.stack(infer_like_losses).mean()
+        infer_like_step0_acc = torch.stack(infer_like_accs).mean()
+    else:
+        infer_like_step0_ce = ce0.new_zeros(())
+        infer_like_step0_acc = ce0.new_zeros(())
+
+    total = ce0 + 0.3 * sub_loss + float(step0_weight) * step0_ce + float(infer_like_step0_weight) * infer_like_step0_ce
+    return total, ce0, sub_loss, step0_ce, step0_acc, infer_like_step0_ce, infer_like_step0_acc
 
 
 def main() -> None:
@@ -531,6 +562,12 @@ def main() -> None:
         type=float,
         default=0.0,
         help="Additional loss weight for the first audio codec_0 token (step-0 bootstrap).",
+    )
+    p.add_argument(
+        "--infer-like-step0-weight",
+        type=float,
+        default=0.0,
+        help="Additional loss weight for infer-like step-0 (prefix-only next-token prediction).",
     )
     p.add_argument(
         "--log-step0-acc",
@@ -637,15 +674,24 @@ def main() -> None:
     sample = next(iter(loader))
     sample = {k: v.to(device) for k, v in sample.items()}
     fwd_inputs = _build_forward_inputs(model, sample, fixed_speaker_embedding)
-    loss, ce0, sub, step0, step0_acc = _forward_losses(model, fwd_inputs, step0_weight=args.step0_weight)
+    loss, ce0, sub, step0, step0_acc, il_step0, il_step0_acc = _forward_losses(
+        model,
+        fwd_inputs,
+        step0_weight=args.step0_weight,
+        infer_like_step0_weight=args.infer_like_step0_weight,
+    )
     loss.backward()
     optimizer.zero_grad(set_to_none=True)
     dry = (
         f"[OK] dry-run passed: total={float(loss.detach().cpu()):.4f} "
-        f"(ce0={float(ce0.detach().cpu()):.4f}, sub={float(sub.detach().cpu()):.4f}, step0={float(step0.detach().cpu()):.4f})"
+        f"(ce0={float(ce0.detach().cpu()):.4f}, sub={float(sub.detach().cpu()):.4f}, "
+        f"step0={float(step0.detach().cpu()):.4f}, infer_like_step0={float(il_step0.detach().cpu()):.4f})"
     )
     if args.log_step0_acc:
-        dry += f" step0_acc={float(step0_acc.detach().cpu()):.4f}"
+        dry += (
+            f" step0_acc={float(step0_acc.detach().cpu()):.4f}"
+            f" infer_like_step0_acc={float(il_step0_acc.detach().cpu()):.4f}"
+        )
     print(dry)
     if args.dry_run_only:
         print("[DONE] dry-run-only mode.")
@@ -667,7 +713,12 @@ def main() -> None:
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) for k, v in batch.items()}
             fwd_inputs = _build_forward_inputs(model, batch, fixed_speaker_embedding)
-            loss, ce0, sub, step0, step0_acc = _forward_losses(model, fwd_inputs, step0_weight=args.step0_weight)
+            loss, ce0, sub, step0, step0_acc, il_step0, il_step0_acc = _forward_losses(
+                model,
+                fwd_inputs,
+                step0_weight=args.step0_weight,
+                infer_like_step0_weight=args.infer_like_step0_weight,
+            )
             (loss / args.grad_accum).backward()
 
             if (step + 1) % args.grad_accum == 0:
@@ -682,10 +733,12 @@ def main() -> None:
                 "ce0": f"{float(ce0.detach().cpu()):.4f}",
                 "sub": f"{float(sub.detach().cpu()):.4f}",
                 "step0": f"{float(step0.detach().cpu()):.4f}",
+                "il_s0": f"{float(il_step0.detach().cpu()):.4f}",
                 "step": global_step,
             }
             if args.log_step0_acc:
                 postfix["s0_acc"] = f"{float(step0_acc.detach().cpu()):.4f}"
+                postfix["il_s0_acc"] = f"{float(il_step0_acc.detach().cpu()):.4f}"
             pbar.set_postfix(**postfix)
 
             if args.max_steps > 0 and global_step >= args.max_steps:
