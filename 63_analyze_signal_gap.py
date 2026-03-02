@@ -512,14 +512,56 @@ def _infer_trainlike_rollout(
         output_hidden_states=True,
         return_dict_in_generate=True,
     )
-    # talker.generate().sequences is codec_0 only. Full [T, G] codes are stored in hidden_states per step.
-    # Keep the same reconstruction rule as Qwen3TTSForConditionalGeneration.generate().
-    step_codes = [hid[-1] for hid in out.hidden_states if hid[-1] is not None]
-    if len(step_codes) == 0:
-        seq = torch.empty((0, int(m.config.talker_config.num_code_groups)), dtype=torch.long)
+    # talker.generate().sequences is codec_0 only. Reconstruct full [T, G] from integer codec traces.
+    g = int(m.config.talker_config.num_code_groups)
+    int_dtypes = {
+        torch.int8, torch.int16, torch.int32, torch.int64,
+        torch.uint8, torch.long,
+    }
+
+    def _collect_codec_tensors(x: Any, out_list: list[torch.Tensor]) -> None:
+        if x is None:
+            return
+        if isinstance(x, torch.Tensor):
+            if x.dtype in int_dtypes:
+                if x.ndim == 2 and x.shape[-1] == g:
+                    out_list.append(x)
+                elif x.ndim == 3 and x.shape[-1] == g and x.shape[1] == 1:
+                    out_list.append(x[:, 0, :])
+            return
+        if isinstance(x, (list, tuple)):
+            for v in x:
+                _collect_codec_tensors(v, out_list)
+            return
+        if isinstance(x, dict):
+            for v in x.values():
+                _collect_codec_tensors(v, out_list)
+
+    codec_steps: list[torch.Tensor] = []
+    _collect_codec_tensors(out.hidden_states, codec_steps)
+    # De-duplicate by storage pointer+shape to avoid repeated walk hits.
+    uniq: list[torch.Tensor] = []
+    seen = set()
+    for t in codec_steps:
+        key = (int(t.data_ptr()), tuple(t.shape), str(t.dtype), str(t.device))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(t)
+    codec_steps = uniq
+
+    if len(codec_steps) == 0:
+        seq = torch.empty((0, g), dtype=torch.long)
     else:
-        talker_codes = torch.stack(step_codes, dim=1)  # [B, T, G]
-        seq = talker_codes[0].detach().cpu().to(torch.long)
+        # Prefer tensors whose first dim is batch(=1). Stack along time.
+        candidate = [t for t in codec_steps if t.ndim == 2 and t.shape[0] == prefix_embeds.shape[0] and t.shape[1] == g]
+        if len(candidate) == 0:
+            candidate = [t for t in codec_steps if t.ndim == 2 and t.shape[1] == g]
+        if len(candidate) == 0:
+            seq = torch.empty((0, g), dtype=torch.long)
+        else:
+            talker_codes = torch.stack(candidate, dim=1)  # [B, T, G] expected
+            seq = talker_codes[0].detach().cpu().to(torch.long)
 
     # Match outer generate() behavior: truncate before first codec EOS at codebook-0.
     eos_id = int(m.config.talker_config.codec_eos_token_id)
@@ -540,6 +582,8 @@ def _infer_trainlike_rollout(
         "has_voice_clone_prompt": False,
         "input_ids_source": "train_like_prefix",
         "infer_path": "talker.generate_from_train_like_prefix",
+        "codec_step_tensors_found": int(len(codec_steps)),
+        "infer_seq_shape": list(seq.shape),
     }
     return seq, meta
 
