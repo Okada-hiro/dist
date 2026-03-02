@@ -413,6 +413,8 @@ def _build_forward_inputs(
     model: Qwen3TTSForConditionalGeneration,
     batch: dict[str, torch.Tensor],
     fixed_speaker_embedding: torch.Tensor,
+    *,
+    disable_step0_sub_teacher_injection: bool = False,
 ) -> dict[str, torch.Tensor]:
     input_ids = batch["input_ids"]
     codec_ids = batch["codec_ids"]
@@ -433,9 +435,21 @@ def _build_forward_inputs(
     input_codec_embedding[row, speaker_pos.to(input_codec_embedding.device), :] = spk.expand(input_codec_embedding.shape[0], -1)
     input_embeddings = input_text_embedding + input_codec_embedding
 
+    # Optional: remove teacher sub-code conditioning only at step0 (first audio frame).
+    # This reduces train/infer mismatch while keeping later-step teacher forcing intact.
+    sub_inject_mask = codec_mask
+    if disable_step0_sub_teacher_injection:
+        sub_inject_mask = codec_mask.clone()
+        bsz, seqlen = sub_inject_mask.shape
+        row = torch.arange(bsz, device=sub_inject_mask.device)
+        pos = audio_start_pos.to(sub_inject_mask.device).to(torch.long)
+        valid = (pos >= 0) & (pos < seqlen)
+        if valid.any():
+            sub_inject_mask[row[valid], pos[valid]] = False
+
     for i in range(1, int(model.talker.config.num_code_groups)):
         codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
-        codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+        codec_i_embedding = codec_i_embedding * sub_inject_mask.unsqueeze(-1)
         input_embeddings = input_embeddings + codec_i_embedding
 
     return {
@@ -454,7 +468,18 @@ def _forward_losses(
     *,
     step0_weight: float = 0.0,
     infer_like_step0_weight: float = 0.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    infer_like_sub0_weight: float = 0.0,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     # Important:
     # Qwen/Transformers causal LM loss path already applies internal next-token shift.
     # Pass full-length inputs/labels here to avoid accidental double-shift.
@@ -506,6 +531,8 @@ def _forward_losses(
     # Use only prefix up to (audio_start - 1), then predict the first audio token.
     infer_like_losses: list[torch.Tensor] = []
     infer_like_accs: list[torch.Tensor] = []
+    infer_like_sub_losses: list[torch.Tensor] = []
+    infer_like_sub_accs: list[torch.Tensor] = []
     bsz = int(audio_start_pos.shape[0])
     for bi in range(bsz):
         start = int(audio_start_pos[bi].item())
@@ -525,6 +552,26 @@ def _forward_losses(
         infer_like_losses.append(ce_pref)
         infer_like_accs.append(acc_pref)
 
+        # Infer-like sub-step0:
+        # condition sub-talker on prefix hidden + predicted codec0, then match GT groups 1..G-1 at step0.
+        hidden_last = o_pref.hidden_states[0][-1][:, -1, :]  # [1, H]
+        pred_c0 = logit_next.argmax(dim=-1).to(torch.long)  # [1]
+        full_step = fwd_inputs["codec_ids"][bi : bi + 1, start, :].to(torch.long)  # [1, G]
+        sub_target = full_step[:, 1:]  # [1, G-1]
+        if sub_target.numel() > 0:
+            sub_seed = torch.zeros_like(full_step)
+            sub_seed[:, 0] = pred_c0
+            sub_logits_i, _ = model.talker.forward_sub_talker_finetune(sub_seed, hidden_last)
+            sub_vocab_i = sub_logits_i.shape[-1]
+            sub_ce_i = F.cross_entropy(
+                sub_logits_i.reshape(-1, sub_vocab_i),
+                sub_target.reshape(-1),
+                reduction="mean",
+            )
+            sub_acc_i = (sub_logits_i.argmax(dim=-1) == sub_target).float().mean()
+            infer_like_sub_losses.append(sub_ce_i)
+            infer_like_sub_accs.append(sub_acc_i)
+
     if infer_like_losses:
         infer_like_step0_ce = torch.stack(infer_like_losses).mean()
         infer_like_step0_acc = torch.stack(infer_like_accs).mean()
@@ -532,8 +579,31 @@ def _forward_losses(
         infer_like_step0_ce = ce0.new_zeros(())
         infer_like_step0_acc = ce0.new_zeros(())
 
-    total = ce0 + 0.3 * sub_loss + float(step0_weight) * step0_ce + float(infer_like_step0_weight) * infer_like_step0_ce
-    return total, ce0, sub_loss, step0_ce, step0_acc, infer_like_step0_ce, infer_like_step0_acc
+    if infer_like_sub_losses:
+        infer_like_sub0_ce = torch.stack(infer_like_sub_losses).mean()
+        infer_like_sub0_acc = torch.stack(infer_like_sub_accs).mean()
+    else:
+        infer_like_sub0_ce = ce0.new_zeros(())
+        infer_like_sub0_acc = ce0.new_zeros(())
+
+    total = (
+        ce0
+        + 0.3 * sub_loss
+        + float(step0_weight) * step0_ce
+        + float(infer_like_step0_weight) * infer_like_step0_ce
+        + float(infer_like_sub0_weight) * infer_like_sub0_ce
+    )
+    return (
+        total,
+        ce0,
+        sub_loss,
+        step0_ce,
+        step0_acc,
+        infer_like_step0_ce,
+        infer_like_step0_acc,
+        infer_like_sub0_ce,
+        infer_like_sub0_acc,
+    )
 
 
 def main() -> None:
@@ -568,6 +638,17 @@ def main() -> None:
         type=float,
         default=0.0,
         help="Additional loss weight for infer-like step-0 (prefix-only next-token prediction).",
+    )
+    p.add_argument(
+        "--infer-like-sub0-weight",
+        type=float,
+        default=0.0,
+        help="Additional loss weight for infer-like sub-step0 (groups 1..G-1 conditioned on predicted step0 codec0).",
+    )
+    p.add_argument(
+        "--disable-step0-sub-teacher-injection",
+        action="store_true",
+        help="Disable GT sub-code (groups 1..G-1) embedding injection only at step0 during training forward.",
     )
     p.add_argument(
         "--log-step0-acc",
@@ -673,24 +754,32 @@ def main() -> None:
     model.train()
     sample = next(iter(loader))
     sample = {k: v.to(device) for k, v in sample.items()}
-    fwd_inputs = _build_forward_inputs(model, sample, fixed_speaker_embedding)
-    loss, ce0, sub, step0, step0_acc, il_step0, il_step0_acc = _forward_losses(
+    fwd_inputs = _build_forward_inputs(
+        model,
+        sample,
+        fixed_speaker_embedding,
+        disable_step0_sub_teacher_injection=args.disable_step0_sub_teacher_injection,
+    )
+    loss, ce0, sub, step0, step0_acc, il_step0, il_step0_acc, il_sub0, il_sub0_acc = _forward_losses(
         model,
         fwd_inputs,
         step0_weight=args.step0_weight,
         infer_like_step0_weight=args.infer_like_step0_weight,
+        infer_like_sub0_weight=args.infer_like_sub0_weight,
     )
     loss.backward()
     optimizer.zero_grad(set_to_none=True)
     dry = (
         f"[OK] dry-run passed: total={float(loss.detach().cpu()):.4f} "
         f"(ce0={float(ce0.detach().cpu()):.4f}, sub={float(sub.detach().cpu()):.4f}, "
-        f"step0={float(step0.detach().cpu()):.4f}, infer_like_step0={float(il_step0.detach().cpu()):.4f})"
+        f"step0={float(step0.detach().cpu()):.4f}, infer_like_step0={float(il_step0.detach().cpu()):.4f}, "
+        f"infer_like_sub0={float(il_sub0.detach().cpu()):.4f})"
     )
     if args.log_step0_acc:
         dry += (
             f" step0_acc={float(step0_acc.detach().cpu()):.4f}"
             f" infer_like_step0_acc={float(il_step0_acc.detach().cpu()):.4f}"
+            f" infer_like_sub0_acc={float(il_sub0_acc.detach().cpu()):.4f}"
         )
     print(dry)
     if args.dry_run_only:
@@ -712,12 +801,18 @@ def main() -> None:
         running = 0.0
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) for k, v in batch.items()}
-            fwd_inputs = _build_forward_inputs(model, batch, fixed_speaker_embedding)
-            loss, ce0, sub, step0, step0_acc, il_step0, il_step0_acc = _forward_losses(
+            fwd_inputs = _build_forward_inputs(
+                model,
+                batch,
+                fixed_speaker_embedding,
+                disable_step0_sub_teacher_injection=args.disable_step0_sub_teacher_injection,
+            )
+            loss, ce0, sub, step0, step0_acc, il_step0, il_step0_acc, il_sub0, il_sub0_acc = _forward_losses(
                 model,
                 fwd_inputs,
                 step0_weight=args.step0_weight,
                 infer_like_step0_weight=args.infer_like_step0_weight,
+                infer_like_sub0_weight=args.infer_like_sub0_weight,
             )
             (loss / args.grad_accum).backward()
 
@@ -734,11 +829,13 @@ def main() -> None:
                 "sub": f"{float(sub.detach().cpu()):.4f}",
                 "step0": f"{float(step0.detach().cpu()):.4f}",
                 "il_s0": f"{float(il_step0.detach().cpu()):.4f}",
+                "il_sub0": f"{float(il_sub0.detach().cpu()):.4f}",
                 "step": global_step,
             }
             if args.log_step0_acc:
                 postfix["s0_acc"] = f"{float(step0_acc.detach().cpu()):.4f}"
                 postfix["il_s0_acc"] = f"{float(il_step0_acc.detach().cpu()):.4f}"
+                postfix["il_sub0_acc"] = f"{float(il_sub0_acc.detach().cpu()):.4f}"
             pbar.set_postfix(**postfix)
 
             if args.max_steps > 0 and global_step >= args.max_steps:
