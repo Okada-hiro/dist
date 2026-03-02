@@ -490,6 +490,31 @@ def _infer_generate_codes(
     return c, meta
 
 
+@torch.no_grad()
+def _inject_fixed_speaker_row(
+    model: Qwen3TTSModel,
+    fixed_spk_id: int,
+    fixed_speaker_embedding: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Temporarily overwrite codec_embedding row used as speaker token in generate path.
+    Returns backup row tensor (cpu) to restore later.
+    """
+    w = model.model.talker.model.codec_embedding.weight
+    idx = int(fixed_spk_id)
+    if idx < 0 or idx >= w.shape[0]:
+        raise ValueError(f"fixed_spk_id out of range: {idx} not in [0, {w.shape[0]-1}]")
+    backup = w[idx].detach().float().cpu().clone()
+    w[idx].copy_(fixed_speaker_embedding.to(w.device).to(w.dtype))
+    return backup
+
+
+@torch.no_grad()
+def _restore_speaker_row(model: Qwen3TTSModel, fixed_spk_id: int, backup_row: torch.Tensor) -> None:
+    w = model.model.talker.model.codec_embedding.weight
+    w[int(fixed_spk_id)].copy_(backup_row.to(w.device).to(w.dtype))
+
+
 def _decode_codes_to_wav(model: Qwen3TTSModel, codes_2d: torch.Tensor, out_path: Path) -> None:
     wavs, sr = model.model.speech_tokenizer.decode([{"audio_codes": codes_2d}])
     sf.write(str(out_path), wavs[0], sr)
@@ -597,6 +622,11 @@ def main() -> None:
     p.add_argument("--device", default=None)
     p.add_argument("--force-clamped-decode", action="store_true", help="If set, also decode clamped student codes when out-of-range.")
     p.add_argument("--infer-no-voice-clone", action="store_true", help="Disable voice-clone prompt in inference path even if ref-audio is given.")
+    p.add_argument(
+        "--infer-inject-fixed-speaker-row",
+        action="store_true",
+        help="Before inference, temporarily overwrite codec_embedding[fixed_spk_id] with the same fixed speaker vector used in train-like path.",
+    )
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -632,17 +662,25 @@ def main() -> None:
         batch = _build_train_like_batch(model, row, fixed_spk_id=args.fixed_spk_id, max_codec_len=None)
         train_pred_codes, train_stats = _teacher_forced_predict(model, batch, fixed_speaker_embedding)
 
-        infer_codes, infer_meta = _infer_generate_codes(
-            model=model,
-            text=text,
-            language=language,
-            ref_audio=args.ref_audio,
-            ref_text=ref_text,
-            x_vector_only=args.x_vector_only,
-            non_streaming_mode=args.non_streaming_mode,
-            max_new_tokens=args.max_new_tokens,
-            use_voice_clone=not args.infer_no_voice_clone,
-        )
+        backup_row = None
+        try:
+            if args.infer_inject_fixed_speaker_row:
+                backup_row = _inject_fixed_speaker_row(model, args.fixed_spk_id, fixed_speaker_embedding)
+            infer_codes, infer_meta = _infer_generate_codes(
+                model=model,
+                text=text,
+                language=language,
+                ref_audio=args.ref_audio,
+                ref_text=ref_text,
+                x_vector_only=args.x_vector_only,
+                non_streaming_mode=args.non_streaming_mode,
+                max_new_tokens=args.max_new_tokens,
+                use_voice_clone=not args.infer_no_voice_clone,
+            )
+            infer_meta["inject_fixed_speaker_row"] = bool(args.infer_inject_fixed_speaker_row)
+        finally:
+            if backup_row is not None:
+                _restore_speaker_row(model, args.fixed_spk_id, backup_row)
 
         n_ti = min(int(train_pred_codes.shape[0]), int(infer_codes.shape[0]))
         ti_acc = float((train_pred_codes[:n_ti] == infer_codes[:n_ti]).float().mean().item()) if n_ti > 0 else 0.0
