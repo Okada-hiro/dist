@@ -310,13 +310,13 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
         input_embeddings = input_embeddings + codec_i_embedding
 
     outputs = m.talker(
-        inputs_embeds=input_embeddings[:, :-1, :],
-        attention_mask=attention_mask[:, :-1],
-        labels=codec_0_labels[:, 1:],
+        inputs_embeds=input_embeddings,
+        attention_mask=attention_mask,
+        labels=codec_0_labels,
         output_hidden_states=True,
     )
     ce0 = float(outputs.loss.detach().cpu())
-    logits0 = outputs.logits[0]  # [L-1, vocab]
+    logits0 = outputs.logits[0][:-1]  # [L-1, vocab]
     labels0 = codec_0_labels[:, 1:][0]
     valid = labels0 != -100
     pred0_all = torch.argmax(logits0, dim=-1)
@@ -334,7 +334,7 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
 
     hidden_states = outputs.hidden_states[0][-1]
     cm = codec_mask[:, 1:]
-    talker_hidden_states = hidden_states[cm]
+    talker_hidden_states = hidden_states[:, :-1, :][cm]
     talker_codec_ids = codec_ids[:, 1:, :][cm]
     assert talker_codec_ids.shape[0] == talker_hidden_states.shape[0], (
         talker_codec_ids.shape,

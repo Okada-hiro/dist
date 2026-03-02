@@ -443,18 +443,22 @@ def _build_forward_inputs(
 
 
 def _forward_losses(model: Qwen3TTSForConditionalGeneration, fwd_inputs: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Important:
+    # Qwen/Transformers causal LM loss path already applies internal next-token shift.
+    # Pass full-length inputs/labels here to avoid accidental double-shift.
     outputs = model.talker(
-        inputs_embeds=fwd_inputs["input_embeddings"][:, :-1, :],
-        attention_mask=fwd_inputs["attention_mask"][:, :-1],
-        labels=fwd_inputs["codec_0_labels"][:, 1:],
+        inputs_embeds=fwd_inputs["input_embeddings"],
+        attention_mask=fwd_inputs["attention_mask"],
+        labels=fwd_inputs["codec_0_labels"],
         output_hidden_states=True,
     )
     ce0 = outputs.loss
 
     hidden_states = outputs.hidden_states[0][-1]
     # Align sub-talker inputs explicitly to the same time base used by hidden_states.
+    # Keep the previous L-1 time base for sub-talker features.
     cm = fwd_inputs["codec_mask"][:, 1:]
-    talker_hidden_states = hidden_states[cm]
+    talker_hidden_states = hidden_states[:, :-1, :][cm]
     talker_codec_ids = fwd_inputs["codec_ids"][:, 1:, :][cm]
     assert talker_codec_ids.shape[0] == talker_hidden_states.shape[0], (
         talker_codec_ids.shape,
