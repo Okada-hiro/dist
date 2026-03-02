@@ -478,6 +478,7 @@ def _infer_trainlike_rollout(
     batch: dict[str, torch.Tensor],
     fixed_speaker_embedding: torch.Tensor,
     max_new_tokens: int,
+    ignore_eos: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     m = model.model
     input_embeddings, attention_mask = _build_trainlike_input_embeddings(model, batch, fixed_speaker_embedding)
@@ -507,7 +508,7 @@ def _infer_trainlike_rollout(
         subtalker_top_k=1,
         subtalker_top_p=1.0,
         subtalker_temperature=1.0,
-        eos_token_id=int(m.config.talker_config.codec_eos_token_id),
+        eos_token_id=None if ignore_eos else int(m.config.talker_config.codec_eos_token_id),
         repetition_penalty=1.0,
         suppress_tokens=[],
         output_hidden_states=True,
@@ -564,12 +565,21 @@ def _infer_trainlike_rollout(
             talker_codes = torch.stack(candidate, dim=1)  # [B, T, G] expected
             seq = talker_codes[0].detach().cpu().to(torch.long)
 
-    # Match outer generate() behavior: truncate before first codec EOS at codebook-0.
+    # Raw c0 eos diagnostics before optional truncation.
     eos_id = int(m.config.talker_config.codec_eos_token_id)
+    raw_c0_eos_count = 0
+    raw_c0_first_eos_pos = None
+    if seq.numel() > 0:
+        raw_c0 = seq[:, 0]
+        raw_eos_pos = torch.nonzero(raw_c0 == eos_id, as_tuple=False).flatten()
+        raw_c0_eos_count = int(raw_eos_pos.numel())
+        raw_c0_first_eos_pos = int(raw_eos_pos[0].item()) if raw_c0_eos_count > 0 else None
+
+    # Match outer generate() behavior: truncate before first codec EOS at codebook-0.
     if seq.numel() > 0:
         c0 = seq[:, 0]
         eos_pos = torch.nonzero(c0 == eos_id, as_tuple=False).flatten()
-        if eos_pos.numel() > 0:
+        if (not ignore_eos) and eos_pos.numel() > 0:
             seq = seq[: int(eos_pos[0].item()), :]
 
     meta = {
@@ -588,6 +598,9 @@ def _infer_trainlike_rollout(
         "talker_sequences_shape": list(out.sequences.shape) if hasattr(out, "sequences") else None,
         "talker_hidden_states_steps": int(len(out.hidden_states)) if getattr(out, "hidden_states", None) is not None else None,
         "prefix_len": int(prefix_embeds.shape[1]),
+        "ignore_eos": bool(ignore_eos),
+        "raw_c0_eos_count_before_trunc": int(raw_c0_eos_count),
+        "raw_c0_first_eos_pos_before_trunc": raw_c0_first_eos_pos,
     }
     return seq, meta
 
@@ -834,6 +847,11 @@ def main() -> None:
         help="Bypass high-level model.generate and run talker.generate from train-like prefix/mask/speaker path.",
     )
     p.add_argument(
+        "--infer-trainlike-ignore-eos",
+        action="store_true",
+        help="Diagnostic mode for trainlike rollout: disable eos stop and disable post-truncation by eos.",
+    )
+    p.add_argument(
         "--infer-use-train-text-ids",
         action="store_true",
         help="Use row.text_input_ids directly for inference input_ids instead of re-tokenizing row.text.",
@@ -897,6 +915,7 @@ def main() -> None:
                     batch=batch,
                     fixed_speaker_embedding=fixed_speaker_embedding,
                     max_new_tokens=infer_max_new_tokens,
+                    ignore_eos=args.infer_trainlike_ignore_eos,
                 )
             else:
                 infer_codes, infer_meta = _infer_generate_codes(
