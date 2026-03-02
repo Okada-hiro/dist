@@ -343,12 +343,14 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
     gt_full = gt_codes[:t].to(torch.long)
 
     codec0_acc = float((pred0_audio[:t] == gt0_audio[:t]).float().mean().item()) if t > 0 else 0.0
+    sub_acc = float((pred_sub[:t] == gt_full[:t, 1:]).float().mean().item()) if t > 0 else 0.0
     full_acc = float((pred_full == gt_full).float().mean().item()) if t > 0 else 0.0
 
     return pred_full.detach().cpu(), {
         "ce0": ce0,
         "sub_loss": sub_loss_v,
         "codec0_acc_teacher_forced": codec0_acc,
+        "sub_acc_teacher_forced": sub_acc,
         "full_acc_teacher_forced": full_acc,
         "teacher_forced_len": int(t),
     }
@@ -569,6 +571,7 @@ def main() -> None:
             "student_infer_len": int(infer_codes.shape[0]),
             "teacher_vs_train_full_acc": train_stats["full_acc_teacher_forced"],
             "teacher_vs_train_codec0_acc": train_stats["codec0_acc_teacher_forced"],
+            "teacher_vs_train_sub_acc": train_stats["sub_acc_teacher_forced"],
             "teacher_vs_infer_full_acc_minlen": gi_acc,
             "train_vs_infer_full_acc_minlen": ti_acc,
             "ce0": train_stats["ce0"],
@@ -591,7 +594,9 @@ def main() -> None:
         report.append(item)
         print(
             f"[ROW] {sid} "
-            f"acc(Tvs2)={item['teacher_vs_train_full_acc']:.4f} "
+            f"acc(Tvs2_full)={item['teacher_vs_train_full_acc']:.4f} "
+            f"acc(Tvs2_c0)={item['teacher_vs_train_codec0_acc']:.4f} "
+            f"acc(Tvs2_sub)={item['teacher_vs_train_sub_acc']:.4f} "
             f"acc(Tvs3)={item['teacher_vs_infer_full_acc_minlen']:.4f} "
             f"acc(2vs3)={item['train_vs_infer_full_acc_minlen']:.4f} "
             f"len(T/2/3)={item['teacher_len']}/{item['student_train_len']}/{item['student_infer_len']}"
