@@ -447,11 +447,12 @@ def _infer_generate_codes(
     x_vector_only: bool,
     non_streaming_mode: bool,
     max_new_tokens: int,
-) -> torch.Tensor:
+    use_voice_clone: bool,
+) -> tuple[torch.Tensor, dict[str, Any]]:
     input_ids = model._tokenize_texts([model._build_assistant_text(text)])
     ref_ids = None
     voice_clone_prompt_dict = None
-    if ref_audio is not None:
+    if use_voice_clone and ref_audio is not None:
         prompt = model.create_voice_clone_prompt(
             ref_audio=ref_audio,
             ref_text=ref_text,
@@ -476,7 +477,17 @@ def _infer_generate_codes(
     c = codes_list[0].detach().cpu().to(torch.long)
     if c.ndim == 1:
         c = c.unsqueeze(-1)
-    return c
+    meta = {
+        "use_voice_clone": bool(use_voice_clone and ref_audio is not None),
+        "x_vector_only": bool(x_vector_only),
+        "non_streaming_mode": bool(non_streaming_mode),
+        "language": language,
+        "max_new_tokens": int(max_new_tokens),
+        "input_text_len": int(input_ids.shape[-1]) if hasattr(input_ids, "shape") else None,
+        "ref_ids_len": int(ref_ids[0].shape[-1]) if ref_ids and ref_ids[0] is not None else None,
+        "has_voice_clone_prompt": voice_clone_prompt_dict is not None,
+    }
+    return c, meta
 
 
 def _decode_codes_to_wav(model: Qwen3TTSModel, codes_2d: torch.Tensor, out_path: Path) -> None:
@@ -585,6 +596,7 @@ def main() -> None:
     p.add_argument("--fixed-spk-id", type=int, default=0)
     p.add_argument("--device", default=None)
     p.add_argument("--force-clamped-decode", action="store_true", help="If set, also decode clamped student codes when out-of-range.")
+    p.add_argument("--infer-no-voice-clone", action="store_true", help="Disable voice-clone prompt in inference path even if ref-audio is given.")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -620,7 +632,7 @@ def main() -> None:
         batch = _build_train_like_batch(model, row, fixed_spk_id=args.fixed_spk_id, max_codec_len=None)
         train_pred_codes, train_stats = _teacher_forced_predict(model, batch, fixed_speaker_embedding)
 
-        infer_codes = _infer_generate_codes(
+        infer_codes, infer_meta = _infer_generate_codes(
             model=model,
             text=text,
             language=language,
@@ -629,6 +641,7 @@ def main() -> None:
             x_vector_only=args.x_vector_only,
             non_streaming_mode=args.non_streaming_mode,
             max_new_tokens=args.max_new_tokens,
+            use_voice_clone=not args.infer_no_voice_clone,
         )
 
         n_ti = min(int(train_pred_codes.shape[0]), int(infer_codes.shape[0]))
@@ -680,6 +693,13 @@ def main() -> None:
             "id": sid,
             "text": text,
             "language": language,
+            "train_like_condition": {
+                "speaker_pos": int(batch["speaker_pos"][0].item()),
+                "input_ids_text_prefix": batch["input_ids"][0, :12, 0].tolist(),
+                "input_ids_codec_prefix": batch["input_ids"][0, :12, 1].tolist(),
+                "codec_mask_true_count": int(batch["codec_mask"][0].sum().item()),
+            },
+            "infer_condition": infer_meta,
             "teacher_len": int(gt_codes_t.shape[0]),
             "student_train_len": int(train_pred_codes.shape[0]),
             "student_infer_len": int(infer_codes.shape[0]),
@@ -734,7 +754,8 @@ def main() -> None:
             f"bestShift(Tvs3)={item['teacher_vs_infer_best_shift']}@{item['teacher_vs_infer_best_shift_acc']:.4f} "
             f"ce0(manual s0/s1)={item['ce0_manual_shift0']:.4f}/{item['ce0_manual_shift1']:.4f} "
             f"acc(2vs3)={item['train_vs_infer_full_acc_minlen']:.4f} "
-            f"len(T/2/3)={item['teacher_len']}/{item['student_train_len']}/{item['student_infer_len']}"
+            f"len(T/2/3)={item['teacher_len']}/{item['student_train_len']}/{item['student_infer_len']} "
+            f"infer(vc/xv/lang)={int(item['infer_condition']['use_voice_clone'])}/{int(item['infer_condition']['x_vector_only'])}/{item['infer_condition']['language']}"
         )
         for n in decode_notes:
             print(f"[NOTE] {sid}: {n}")
