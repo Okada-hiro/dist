@@ -477,13 +477,22 @@ def _infer_generate_codes(
     c = codes_list[0].detach().cpu().to(torch.long)
     if c.ndim == 1:
         c = c.unsqueeze(-1)
+    input_text_len = None
+    try:
+        if isinstance(input_ids, torch.Tensor):
+            input_text_len = int(input_ids.shape[-1])
+        elif isinstance(input_ids, list) and len(input_ids) > 0 and hasattr(input_ids[0], "__len__"):
+            input_text_len = int(len(input_ids[0]))
+    except Exception:
+        input_text_len = None
+
     meta = {
         "use_voice_clone": bool(use_voice_clone and ref_audio is not None),
         "x_vector_only": bool(x_vector_only),
         "non_streaming_mode": bool(non_streaming_mode),
         "language": language,
         "max_new_tokens": int(max_new_tokens),
-        "input_text_len": int(input_ids.shape[-1]) if hasattr(input_ids, "shape") else None,
+        "input_text_len": input_text_len,
         "ref_ids_len": int(ref_ids[0].shape[-1]) if ref_ids and ref_ids[0] is not None else None,
         "has_voice_clone_prompt": voice_clone_prompt_dict is not None,
     }
@@ -518,6 +527,39 @@ def _restore_speaker_row(model: Qwen3TTSModel, fixed_spk_id: int, backup_row: to
 def _decode_codes_to_wav(model: Qwen3TTSModel, codes_2d: torch.Tensor, out_path: Path) -> None:
     wavs, sr = model.model.speech_tokenizer.decode([{"audio_codes": codes_2d}])
     sf.write(str(out_path), wavs[0], sr)
+
+
+def _first_mismatch_step(a: torch.Tensor, b: torch.Tensor) -> int:
+    """
+    Return first time index where rows differ; -1 if all equal in compared range.
+    """
+    n = min(int(a.shape[0]), int(b.shape[0]))
+    if n <= 0:
+        return -1
+    diff = (a[:n] != b[:n]).any(dim=-1)
+    idx = torch.nonzero(diff, as_tuple=False)
+    return int(idx[0].item()) if idx.numel() > 0 else -1
+
+
+def _prefix_curve(a: torch.Tensor, b: torch.Tensor, max_points: int = 10) -> list[dict[str, float]]:
+    """
+    Prefix accuracy curve to observe autoregressive drift.
+    """
+    n = min(int(a.shape[0]), int(b.shape[0]))
+    if n <= 0:
+        return []
+    steps = []
+    k = 1
+    while k < n and len(steps) < max_points - 1:
+        steps.append(k)
+        k *= 2
+    if not steps or steps[-1] != n:
+        steps.append(n)
+    out: list[dict[str, float]] = []
+    for s in steps:
+        acc = float((a[:s] == b[:s]).float().mean().item())
+        out.append({"step": float(s), "acc": acc})
+    return out
 
 
 def _best_shift_acc(pred: torch.Tensor, gt: torch.Tensor, max_shift: int = 3) -> tuple[int, float]:
@@ -688,6 +730,16 @@ def main() -> None:
         gi_acc = float((gt_codes_t[:n_gt_inf] == infer_codes[:n_gt_inf]).float().mean().item()) if n_gt_inf > 0 else 0.0
         best_shift_t2, best_acc_t2 = _best_shift_acc(train_pred_codes, gt_codes_t, max_shift=3)
         best_shift_t3, best_acc_t3 = _best_shift_acc(infer_codes, gt_codes_t, max_shift=3)
+        first_mismatch_2v3 = _first_mismatch_step(train_pred_codes, infer_codes)
+        first_mismatch_t3 = _first_mismatch_step(gt_codes_t, infer_codes)
+        curve_2v3 = _prefix_curve(train_pred_codes, infer_codes, max_points=10)
+        curve_t3 = _prefix_curve(gt_codes_t, infer_codes, max_points=10)
+
+        codec_eos_id = int(model.model.config.talker_config.codec_eos_token_id)
+        infer_codec0 = infer_codes[:, 0] if infer_codes.ndim == 2 and infer_codes.shape[1] > 0 else torch.empty(0, dtype=torch.long)
+        eos_pos = torch.nonzero(infer_codec0 == codec_eos_id, as_tuple=False).flatten()
+        eos_count = int(eos_pos.numel())
+        eos_first = int(eos_pos[0].item()) if eos_count > 0 else None
 
         teacher_wav = out_dir / f"{sid}.teacher_signal.wav"
         student_train_wav = out_dir / f"{sid}.student_train_signal.wav"
@@ -738,6 +790,17 @@ def main() -> None:
                 "codec_mask_true_count": int(batch["codec_mask"][0].sum().item()),
             },
             "infer_condition": infer_meta,
+            "infer_diagnostics": {
+                "codec_eos_id": codec_eos_id,
+                "codec0_eos_count": eos_count,
+                "codec0_first_eos_pos": eos_first,
+                "infer_hit_max_new_tokens": bool(int(infer_codes.shape[0]) >= int(args.max_new_tokens)),
+                "infer_len_ratio_vs_teacher": float(int(infer_codes.shape[0]) / max(1, int(gt_codes_t.shape[0]))),
+                "first_mismatch_step_train_vs_infer": int(first_mismatch_2v3),
+                "first_mismatch_step_teacher_vs_infer": int(first_mismatch_t3),
+                "prefix_curve_train_vs_infer": curve_2v3,
+                "prefix_curve_teacher_vs_infer": curve_t3,
+            },
             "teacher_len": int(gt_codes_t.shape[0]),
             "student_train_len": int(train_pred_codes.shape[0]),
             "student_infer_len": int(infer_codes.shape[0]),
@@ -793,7 +856,9 @@ def main() -> None:
             f"ce0(manual s0/s1)={item['ce0_manual_shift0']:.4f}/{item['ce0_manual_shift1']:.4f} "
             f"acc(2vs3)={item['train_vs_infer_full_acc_minlen']:.4f} "
             f"len(T/2/3)={item['teacher_len']}/{item['student_train_len']}/{item['student_infer_len']} "
-            f"infer(vc/xv/lang)={int(item['infer_condition']['use_voice_clone'])}/{int(item['infer_condition']['x_vector_only'])}/{item['infer_condition']['language']}"
+            f"infer(vc/xv/lang)={int(item['infer_condition']['use_voice_clone'])}/{int(item['infer_condition']['x_vector_only'])}/{item['infer_condition']['language']} "
+            f"eos(c0)={item['infer_diagnostics']['codec0_eos_count']} first={item['infer_diagnostics']['codec0_first_eos_pos']} "
+            f"mismatch(t->i)={item['infer_diagnostics']['first_mismatch_step_teacher_vs_infer']}"
         )
         for n in decode_notes:
             print(f"[NOTE] {sid}: {n}")
