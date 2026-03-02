@@ -448,8 +448,17 @@ def _infer_generate_codes(
     non_streaming_mode: bool,
     max_new_tokens: int,
     use_voice_clone: bool,
+    input_ids_override: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    input_ids = model._tokenize_texts([model._build_assistant_text(text)])
+    if input_ids_override is not None:
+        iid = input_ids_override.detach().clone().to(model.model.device).to(torch.long)
+        if iid.ndim == 1:
+            iid = iid.unsqueeze(0)
+        input_ids = [iid]
+        input_ids_source = "train_text_input_ids"
+    else:
+        input_ids = model._tokenize_texts([model._build_assistant_text(text)])
+        input_ids_source = "tokenized_from_text"
     ref_ids = None
     voice_clone_prompt_dict = None
     if use_voice_clone and ref_audio is not None:
@@ -492,6 +501,7 @@ def _infer_generate_codes(
         "non_streaming_mode": bool(non_streaming_mode),
         "language": language,
         "max_new_tokens": int(max_new_tokens),
+        "input_ids_source": input_ids_source,
         "input_text_len": input_text_len,
         "ref_ids_len": int(ref_ids[0].shape[-1]) if ref_ids and ref_ids[0] is not None else None,
         "has_voice_clone_prompt": voice_clone_prompt_dict is not None,
@@ -665,6 +675,16 @@ def main() -> None:
     p.add_argument("--force-clamped-decode", action="store_true", help="If set, also decode clamped student codes when out-of-range.")
     p.add_argument("--infer-no-voice-clone", action="store_true", help="Disable voice-clone prompt in inference path even if ref-audio is given.")
     p.add_argument(
+        "--infer-use-train-text-ids",
+        action="store_true",
+        help="Use row.text_input_ids directly for inference input_ids instead of re-tokenizing row.text.",
+    )
+    p.add_argument(
+        "--infer-max-new-tokens-like-teacher",
+        action="store_true",
+        help="Use teacher codec length as max_new_tokens for each sample.",
+    )
+    p.add_argument(
         "--infer-inject-fixed-speaker-row",
         action="store_true",
         help="Before inference, temporarily overwrite codec_embedding[fixed_spk_id] with the same fixed speaker vector used in train-like path.",
@@ -708,6 +728,10 @@ def main() -> None:
         try:
             if args.infer_inject_fixed_speaker_row:
                 backup_row = _inject_fixed_speaker_row(model, args.fixed_spk_id, fixed_speaker_embedding)
+            infer_input_ids_override = None
+            if args.infer_use_train_text_ids and row.get("text_input_ids") is not None:
+                infer_input_ids_override = _normalize_text_ids_1d(row.get("text_input_ids"))
+            infer_max_new_tokens = int(gt_codes_t.shape[0]) if args.infer_max_new_tokens_like_teacher else int(args.max_new_tokens)
             infer_codes, infer_meta = _infer_generate_codes(
                 model=model,
                 text=text,
@@ -716,10 +740,12 @@ def main() -> None:
                 ref_text=ref_text,
                 x_vector_only=args.x_vector_only,
                 non_streaming_mode=args.non_streaming_mode,
-                max_new_tokens=args.max_new_tokens,
+                max_new_tokens=infer_max_new_tokens,
                 use_voice_clone=not args.infer_no_voice_clone,
+                input_ids_override=infer_input_ids_override,
             )
             infer_meta["inject_fixed_speaker_row"] = bool(args.infer_inject_fixed_speaker_row)
+            infer_meta["max_new_tokens_like_teacher"] = bool(args.infer_max_new_tokens_like_teacher)
         finally:
             if backup_row is not None:
                 _restore_speaker_row(model, args.fixed_spk_id, backup_row)
@@ -794,7 +820,7 @@ def main() -> None:
                 "codec_eos_id": codec_eos_id,
                 "codec0_eos_count": eos_count,
                 "codec0_first_eos_pos": eos_first,
-                "infer_hit_max_new_tokens": bool(int(infer_codes.shape[0]) >= int(args.max_new_tokens)),
+                "infer_hit_max_new_tokens": bool(int(infer_codes.shape[0]) >= int(infer_meta["max_new_tokens"])),
                 "infer_len_ratio_vs_teacher": float(int(infer_codes.shape[0]) / max(1, int(gt_codes_t.shape[0]))),
                 "first_mismatch_step_train_vs_infer": int(first_mismatch_2v3),
                 "first_mismatch_step_teacher_vs_infer": int(first_mismatch_t3),
