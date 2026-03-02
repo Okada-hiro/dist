@@ -512,9 +512,14 @@ def _infer_trainlike_rollout(
         output_hidden_states=True,
         return_dict_in_generate=True,
     )
-    seq = out.sequences[0].detach().cpu().to(torch.long)
-    if seq.ndim == 1:
-        seq = seq.unsqueeze(-1)
+    # talker.generate().sequences is codec_0 only. Full [T, G] codes are stored in hidden_states per step.
+    # Keep the same reconstruction rule as Qwen3TTSForConditionalGeneration.generate().
+    step_codes = [hid[-1] for hid in out.hidden_states if hid[-1] is not None]
+    if len(step_codes) == 0:
+        seq = torch.empty((0, int(m.config.talker_config.num_code_groups)), dtype=torch.long)
+    else:
+        talker_codes = torch.stack(step_codes, dim=1)  # [B, T, G]
+        seq = talker_codes[0].detach().cpu().to(torch.long)
 
     # Match outer generate() behavior: truncate before first codec EOS at codebook-0.
     eos_id = int(m.config.talker_config.codec_eos_token_id)
