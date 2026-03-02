@@ -333,8 +333,13 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
         gt0_audio = gt0
 
     hidden_states = outputs.hidden_states[0][-1]
-    talker_hidden_states = hidden_states[codec_mask[:, 1:]]
-    talker_codec_ids = codec_ids[codec_mask]
+    cm = codec_mask[:, 1:]
+    talker_hidden_states = hidden_states[cm]
+    talker_codec_ids = codec_ids[:, 1:, :][cm]
+    assert talker_codec_ids.shape[0] == talker_hidden_states.shape[0], (
+        talker_codec_ids.shape,
+        talker_hidden_states.shape,
+    )
     sub_logits, sub_loss = m.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
     sub_loss_v = float(sub_loss.detach().cpu())
     pred_sub = torch.argmax(sub_logits, dim=-1)  # [T, G-1]

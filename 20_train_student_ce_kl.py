@@ -452,9 +452,14 @@ def _forward_losses(model: Qwen3TTSForConditionalGeneration, fwd_inputs: dict[st
     ce0 = outputs.loss
 
     hidden_states = outputs.hidden_states[0][-1]
-    codec_mask = fwd_inputs["codec_mask"][:, 1:]
-    talker_hidden_states = hidden_states[codec_mask]
-    talker_codec_ids = fwd_inputs["codec_ids"][fwd_inputs["codec_mask"]]
+    # Align sub-talker inputs explicitly to the same time base used by hidden_states.
+    cm = fwd_inputs["codec_mask"][:, 1:]
+    talker_hidden_states = hidden_states[cm]
+    talker_codec_ids = fwd_inputs["codec_ids"][:, 1:, :][cm]
+    assert talker_codec_ids.shape[0] == talker_hidden_states.shape[0], (
+        talker_codec_ids.shape,
+        talker_hidden_states.shape,
+    )
     _, sub_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
     total = ce0 + 0.3 * sub_loss
     return total, ce0, sub_loss
