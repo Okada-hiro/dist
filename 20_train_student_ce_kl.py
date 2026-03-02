@@ -543,7 +543,7 @@ def _forward_losses(
         o_pref = model.talker(
             inputs_embeds=pref_emb,
             attention_mask=pref_attn,
-            output_hidden_states=False,
+            output_hidden_states=True,
         )
         logit_next = o_pref.logits[:, -1, :]  # predicts token at position == start
         target_next = fwd_inputs["codec_ids"][bi : bi + 1, start, 0].to(torch.long)
