@@ -349,7 +349,8 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
     gt_full = gt_codes[:t].to(torch.long)
 
     codec0_acc = float((pred0_audio[:t] == gt0_audio[:t]).float().mean().item()) if t > 0 else 0.0
-    sub_acc = float((pred_sub[:t] == gt_full[:t, 1:]).float().mean().item()) if t > 0 else 0.0
+    gt_sub = gt_full[:t, 1:]
+    sub_acc = float((pred_sub[:t] == gt_sub).float().mean().item()) if t > 0 else 0.0
     full_acc = float((pred_full == gt_full).float().mean().item()) if t > 0 else 0.0
 
     # Diagnose label/logit alignment explicitly:
@@ -369,6 +370,32 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
 
     c0_best_shift, c0_best_shift_acc = _best_shift_acc(pred0_audio, gt0_audio, max_shift=3)
 
+    # Sub diagnostics: alignment and optional double-shift suspicion.
+    sub_acc_shift0 = sub_acc
+    sub_acc_shift1 = 0.0
+    if t > 1:
+        sub_acc_shift1 = float((pred_sub[: t - 1] == gt_sub[1:t]).float().mean().item())
+
+    sub_best_shift = 0
+    sub_best_shift_acc = 0.0
+    for s in range(-3, 4):
+        if s > 0:
+            p = pred_sub[s:t]
+            g = gt_sub[: t - s]
+        elif s < 0:
+            p = pred_sub[: t + s]
+            g = gt_sub[-s:t]
+        else:
+            p = pred_sub[:t]
+            g = gt_sub[:t]
+        n = min(int(p.shape[0]), int(g.shape[0]))
+        if n <= 0:
+            continue
+        a = float((p[:n] == g[:n]).float().mean().item())
+        if a > sub_best_shift_acc:
+            sub_best_shift_acc = a
+            sub_best_shift = s
+
     return pred_full.detach().cpu(), {
         "ce0": ce0,
         "ce0_manual_shift0": ce_shift0,
@@ -378,6 +405,10 @@ def _teacher_forced_predict(model: Qwen3TTSModel, batch: dict[str, torch.Tensor]
         "codec0_best_shift": int(c0_best_shift),
         "codec0_best_shift_acc": float(c0_best_shift_acc),
         "sub_acc_teacher_forced": sub_acc,
+        "sub_acc_shift0": float(sub_acc_shift0),
+        "sub_acc_shift1": float(sub_acc_shift1),
+        "sub_best_shift": int(sub_best_shift),
+        "sub_best_shift_acc": float(sub_best_shift_acc),
         "full_acc_teacher_forced": full_acc,
         "teacher_forced_len": int(t),
     }
@@ -633,6 +664,10 @@ def main() -> None:
             "teacher_vs_train_codec0_best_shift": train_stats["codec0_best_shift"],
             "teacher_vs_train_codec0_best_shift_acc": train_stats["codec0_best_shift_acc"],
             "teacher_vs_train_sub_acc": train_stats["sub_acc_teacher_forced"],
+            "teacher_vs_train_sub_acc_shift0": train_stats["sub_acc_shift0"],
+            "teacher_vs_train_sub_acc_shift1": train_stats["sub_acc_shift1"],
+            "teacher_vs_train_sub_best_shift": train_stats["sub_best_shift"],
+            "teacher_vs_train_sub_best_shift_acc": train_stats["sub_best_shift_acc"],
             "teacher_vs_infer_full_acc_minlen": gi_acc,
             "train_vs_infer_full_acc_minlen": ti_acc,
             "teacher_vs_train_best_shift": int(best_shift_t2),
@@ -665,6 +700,8 @@ def main() -> None:
             f"acc(Tvs2_c0)={item['teacher_vs_train_codec0_acc']:.4f} "
             f"bestShift_c0={item['teacher_vs_train_codec0_best_shift']}@{item['teacher_vs_train_codec0_best_shift_acc']:.4f} "
             f"acc(Tvs2_sub)={item['teacher_vs_train_sub_acc']:.4f} "
+            f"sub(s0/s1)={item['teacher_vs_train_sub_acc_shift0']:.4f}/{item['teacher_vs_train_sub_acc_shift1']:.4f} "
+            f"bestShift_sub={item['teacher_vs_train_sub_best_shift']}@{item['teacher_vs_train_sub_best_shift_acc']:.4f} "
             f"acc(Tvs3)={item['teacher_vs_infer_full_acc_minlen']:.4f} "
             f"bestShift(Tvs2)={item['teacher_vs_train_best_shift']}@{item['teacher_vs_train_best_shift_acc']:.4f} "
             f"bestShift(Tvs3)={item['teacher_vs_infer_best_shift']}@{item['teacher_vs_infer_best_shift_acc']:.4f} "
